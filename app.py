@@ -1,7 +1,8 @@
 import csv
 import hashlib
+import random
 from io import StringIO
-from fastapi import FastAPI, Form, Depends, Cookie, Response, UploadFile, File
+from fastapi import FastAPI, Form, Depends, Cookie, Response, UploadFile, File, HTTPException, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.exception_handlers import http_exception_handler
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -23,8 +24,6 @@ app = FastAPI(title="EIPL Enterprise Procurement Framework")
 # -------------------------------------------------------------
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
-    # Instantly returns an empty response so the browser stops searching,
-    # which prevents a 404 exception from being thrown.
     return Response(status_code=204)
 
 
@@ -35,8 +34,6 @@ def favicon():
 async def custom_http_exception_handler(request, exc):
     if exc.status_code == 404 and not request.cookies.get("session_user"):
         return RedirectResponse(url="/login", status_code=303)
-    
-    # Correctly await the async built-in handler to avoid the coroutine crash
     return await http_exception_handler(request, exc)
 
 
@@ -50,22 +47,29 @@ def run_structural_database_migrations():
     db = SessionLocal()
     try:
         with engine.connect() as conn:
-            # Check employees table
             inspector_emp = engine.dialect.get_columns(conn, "employees")
             existing_cols_emp = [col['name'] for col in inspector_emp]
             
-            # Check procurement requests table
             inspector_proc = engine.dialect.get_columns(conn, "procurement_requests")
             existing_cols_proc = [col['name'] for col in inspector_proc]
+
+            inspector_ma = engine.dialect.get_columns(conn, "material_assignments")
+            existing_cols_ma = [col['name'] for col in inspector_ma]
 
         if "location" not in existing_cols_emp:
             db.execute(text("ALTER TABLE employees ADD COLUMN location TEXT DEFAULT 'Not Specified'"))
         if "contact" not in existing_cols_emp:
             db.execute(text("ALTER TABLE employees ADD COLUMN contact TEXT DEFAULT 'Not Specified'"))
-            
-        # Migrate procurement department structure safely 
         if "department" not in existing_cols_proc:
             db.execute(text("ALTER TABLE procurement_requests ADD COLUMN department TEXT DEFAULT 'Operations'"))
+        if "department" not in existing_cols_ma:
+            db.execute(text("ALTER TABLE material_assignments ADD COLUMN department TEXT DEFAULT 'General Operations'"))
+        if "mis_filename" not in existing_cols_ma:
+            db.execute(text("ALTER TABLE material_assignments ADD COLUMN mis_filename TEXT"))
+        if "mis_uploaded_by_id" not in existing_cols_ma:
+            db.execute(text("ALTER TABLE material_assignments ADD COLUMN mis_uploaded_by_id INTEGER"))
+        if "mis_upload_timestamp" not in existing_cols_ma:
+            db.execute(text("ALTER TABLE material_assignments ADD COLUMN mis_upload_timestamp DATETIME"))
             
         db.commit()
     except Exception as e:
@@ -73,6 +77,23 @@ def run_structural_database_migrations():
         print(f"[Migration Adaptive Notice] Columns pre-aligned: {e}")
     finally:
         db.close()
+
+    # Ensure procurement_messages table exists (new feature)
+    try:
+        db2 = SessionLocal()
+        db2.execute(text("""
+            CREATE TABLE IF NOT EXISTS procurement_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER REFERENCES procurement_requests(id),
+                sender_id INTEGER REFERENCES users(id),
+                message TEXT,
+                timestamp DATETIME
+            )
+        """))
+        db2.commit()
+        db2.close()
+    except Exception as e:
+        print(f"[Migration] procurement_messages: {e}")
 
 
 run_structural_database_migrations()
@@ -147,43 +168,212 @@ def do_logout():
 
 
 @app.post("/transaction")
-def create_transaction(
+async def create_transaction(
     item_id: int = Form(...),
-    type: str = Form(...),
     quantity: int = Form(...),
+    uom: str = Form(...),
+    grn_file: UploadFile = File(...),
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     if not current_user:
         return RedirectResponse(url="/login", status_code=303)
 
+    # GRN file is mandatory
+    if not grn_file or not grn_file.filename:
+        return HTMLResponse("<script>alert('GRN Upload is mandatory before recording an Inward Transaction.'); window.history.back();</script>")
+
     item = db.query(models.Item).filter(models.Item.id == item_id).first()
     if not item:
-        return HTMLResponse("<script>alert('Mutation Failed: Item not found.'); window.location='/';</script>")
+        return HTMLResponse("<script>alert('Item not found.'); window.location='/';</script>")
 
-    op_type = type.strip().upper()
-    if op_type == "OUT":
-        if item.current_stock < quantity:
-            return HTMLResponse("<script>alert('Blocked: Insufficient warehouse stock level!'); window.location='/';</script>")
-        item.current_stock -= quantity
-    elif op_type == "IN":
-        item.current_stock += quantity
-    else:
-        return HTMLResponse("<script>alert('Mutation Error: Invalid operations token.'); window.location='/';</script>")
+    # Save GRN file to disk
+    import os, shutil
+    grn_dir = "grn_uploads"
+    os.makedirs(grn_dir, exist_ok=True)
+    import datetime
+    timestamp_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_filename = f"GRN_{item.item_code}_{timestamp_str}_{grn_file.filename.replace(' ', '_')}"
+    grn_path = os.path.join(grn_dir, safe_filename)
+    contents = await grn_file.read()
+    with open(grn_path, "wb") as f:
+        f.write(contents)
 
+    # Always IN for inward transaction
+    item.current_stock += quantity
     item_unit_price = item.price if item.price is not None else 0.0
     db.add(models.Transaction(
         item_id=item.id,
-        type=op_type,
+        type="IN",
         quantity=quantity,
         user_id=current_user.id,
         total_value=float(quantity * item_unit_price)
+    ))
+
+    # Save GRN record
+    db.add(models.GRNRecord(
+        item_id=item.id,
+        quantity=quantity,
+        uom=uom,
+        grn_filename=safe_filename,
+        uploaded_by_id=current_user.id
     ))
     db.commit()
     return RedirectResponse(url="/", status_code=303)
 
 
-@app.post("/items/bulk-import")
+@app.get("/grn/list", response_class=HTMLResponse)
+def grn_list(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    grns = db.query(models.GRNRecord).order_by(models.GRNRecord.timestamp.desc()).all()
+    rows = ""
+    for g in grns:
+        ts = g.timestamp.strftime("%d-%m-%Y %H:%M") if g.timestamp else ""
+        item_name = g.item.name if g.item else "Unknown Item"
+        item_code = g.item.item_code if g.item else "—"
+        uploader = g.uploader.username if g.uploader else "System"
+        rows += f"""
+        <tr class="border-b hover:bg-slate-50 text-xs">
+            <td class="p-3 text-slate-500 font-mono">{ts}</td>
+            <td class="p-3 font-semibold text-slate-800">{item_name}</td>
+            <td class="p-3 font-mono text-slate-500">{item_code}</td>
+            <td class="p-3 text-center font-mono font-bold text-slate-700">{g.quantity} {g.uom}</td>
+            <td class="p-3 text-slate-500">{uploader}</td>
+            <td class="p-3 text-right">
+                <a href="/grn/download/{g.id}" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all">⬇ Download</a>
+            </td>
+        </tr>"""
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>GRN Downloads - EIPL</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>body{{font-family:'Inter',sans-serif;}}</style>
+</head>
+<body class="bg-slate-50 min-h-screen p-8">
+    <div class="max-w-5xl mx-auto">
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <a href="/" class="text-indigo-600 text-xs font-bold hover:underline">&#8592; Back to Dashboard</a>
+                <h1 class="text-xl font-black text-slate-900 mt-1">&#128196; GRN Download Centre</h1>
+                <p class="text-xs text-slate-400 mt-0.5">Goods Received Notes — uploaded inward transaction records</p>
+            </div>
+            <a href="/mis/list" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-xs px-4 py-2 rounded-lg transition-all border border-indigo-200">&#128203; MIS Download Centre</a>
+        </div>
+        <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+            <table class="w-full text-left border-collapse">
+                <thead>
+                    <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase text-xs border-b border-slate-200">
+                        <th class="p-4">Timestamp</th>
+                        <th class="p-4">Item Name</th>
+                        <th class="p-4">Item Code</th>
+                        <th class="p-4 text-center">Qty / UOM</th>
+                        <th class="p-4">Uploaded By</th>
+                        <th class="p-4 text-right pr-5">Action</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">{rows if rows else '<tr><td colspan="6" class="p-8 text-center text-slate-400 text-sm">No GRNs uploaded yet.</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+</body></html>"""
+    return HTMLResponse(html)
+
+
+@app.get("/grn/download/{grn_id}")
+def grn_download(grn_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    import os
+    from fastapi.responses import FileResponse
+    grn = db.query(models.GRNRecord).filter(models.GRNRecord.id == grn_id).first()
+    if not grn:
+        raise HTTPException(status_code=404, detail="GRN not found")
+    grn_path = os.path.join("grn_uploads", grn.grn_filename)
+    if not os.path.exists(grn_path):
+        raise HTTPException(status_code=404, detail="GRN file missing from server")
+    return FileResponse(path=grn_path, filename=grn.grn_filename, media_type="application/octet-stream")
+
+
+@app.get("/mis/list", response_class=HTMLResponse)
+def mis_list(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    assignments = db.query(models.MaterialAssignment).filter(
+        models.MaterialAssignment.mis_filename != None
+    ).order_by(models.MaterialAssignment.timestamp.desc()).all()
+    rows = ""
+    for a in assignments:
+        ts = a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else ""
+        item_name = a.item.name if a.item else "Unknown Item"
+        item_code = a.item.item_code if a.item else "—"
+        dept = getattr(a, 'department', '—') or '—'
+        rows += f"""
+        <tr class="border-b hover:bg-slate-50 text-xs">
+            <td class="p-3 text-slate-500 font-mono">{ts}</td>
+            <td class="p-3 font-semibold text-slate-800">{item_name}</td>
+            <td class="p-3 font-mono text-slate-500">{item_code}</td>
+            <td class="p-3 text-center font-mono font-bold text-slate-700">{a.quantity} {a.uom}</td>
+            <td class="p-3 text-slate-700 font-medium">{a.issued_to}</td>
+            <td class="p-3 text-slate-500">{dept}</td>
+            <td class="p-3 text-right">
+                <a href="/mis/download/{a.id}" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all">⬇ Download MIS</a>
+            </td>
+        </tr>"""
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>MIS Download Centre - EIPL</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>body{{font-family:'Inter',sans-serif;}}</style>
+</head>
+<body class="bg-slate-50 min-h-screen p-8">
+    <div class="max-w-5xl mx-auto">
+        <div class="flex items-center justify-between mb-6">
+            <div>
+                <a href="/" class="text-indigo-600 text-xs font-bold hover:underline">&#8592; Back to Dashboard</a>
+                <h1 class="text-xl font-black text-slate-900 mt-1">&#128203; MIS Download Centre</h1>
+                <p class="text-xs text-slate-400 mt-0.5">Material Issue Slips — uploaded issuance records</p>
+            </div>
+            <a href="/grn/list" class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-4 py-2 rounded-lg transition-all border border-slate-200">&#128196; GRN Download Centre</a>
+        </div>
+        <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+            <table class="w-full text-left border-collapse">
+                <thead>
+                    <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase text-xs border-b border-slate-200">
+                        <th class="p-4">Timestamp</th>
+                        <th class="p-4">Item Name</th>
+                        <th class="p-4">Item Code</th>
+                        <th class="p-4 text-center">Qty / UOM</th>
+                        <th class="p-4">Issued To</th>
+                        <th class="p-4">Department</th>
+                        <th class="p-4 text-right pr-5">Action</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100">{rows if rows else '<tr><td colspan="7" class="p-8 text-center text-slate-400 text-sm">No MIS records uploaded yet.</td></tr>'}</tbody>
+            </table>
+        </div>
+    </div>
+</body></html>"""
+    return HTMLResponse(html)
+
+
+@app.get("/mis/download/{assignment_id}")
+def mis_download(assignment_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    import os
+    from fastapi.responses import FileResponse
+    a = db.query(models.MaterialAssignment).filter(models.MaterialAssignment.id == assignment_id).first()
+    if not a or not a.mis_filename:
+        raise HTTPException(status_code=404, detail="MIS not found")
+    mis_path = os.path.join("mis_uploads", a.mis_filename)
+    if not os.path.exists(mis_path):
+        raise HTTPException(status_code=404, detail="MIS file missing from server")
+    return FileResponse(path=mis_path, filename=a.mis_filename, media_type="application/octet-stream")
+
+
 async def items_bulk_import(
     file: UploadFile = File(...),
     current_user: models.User = Depends(get_current_user),
@@ -197,7 +387,6 @@ async def items_bulk_import(
         if not contents:
             return HTMLResponse("<script>alert('Error: Uploaded file is empty.'); window.location='/';</script>")
             
-        # --- SMART ENCODING FALLBACK MECHANISM ---
         try:
             decoded_content = contents.decode('utf-8-sig')
         except UnicodeDecodeError:
@@ -206,13 +395,9 @@ async def items_bulk_import(
             except UnicodeDecodeError:
                 decoded_content = contents.decode('latin-1')
 
-        # --- FIX: SPLIT LINES TO PREVENT NEWLINE ERRORS ---
-        # Splitting by splitlines() handles all variations of \r, \n, and \r\n safely.
         clean_lines = decoded_content.splitlines()
         
-        # --- DYNAMIC CSV DIALECT SNIFFER ---
         try:
-            # Sniff using the first few lines instead of raw string slice
             sample_data = "\n".join(clean_lines[:5])
             dialect = csv.Sniffer().sniff(sample_data)
             if dialect.delimiter not in [',', ';', '\t', '|']:
@@ -229,19 +414,13 @@ async def items_bulk_import(
             row_index += 1
             if not row:
                 continue
-            
-            # 👇 ADD THIS LINE TEMPORARILY FOR DEBUGGING 👇
-            print(f"👉 RAW CSV ROW DATA: {dict(row)}")
-    
-            # Clean spaces from keys and values safely
+                
             clean_row = {str(k).strip().lower(): str(v).strip() for k, v in row.items() if k is not None}
 
-            # Example: Adding "product name" and "sku" if that's what your file uses
-            name = clean_row.get("name") or clean_row.get("item name") or clean_row.get("product name")
-            item_code = clean_row.get("item_code") or clean_row.get("code") or clean_row.get("sku")
+            name = clean_row.get("name") or clean_row.get("item name") or clean_row.get("item_name") or clean_row.get("product name")
+            item_code = clean_row.get("item_code") or clean_row.get("code") or clean_row.get("item code") or clean_row.get("sku")
 
             if not name or not item_code:
-                print(f"[Bulk Import Warning] Skipping Row {row_index}: Missing structural 'name' or 'item_code'. Parsed headers look like: {list(clean_row.keys())}")
                 continue
 
             item_code = item_code.upper()
@@ -257,24 +436,27 @@ async def items_bulk_import(
 
             vendor = clean_row.get("vendor") or clean_row.get("supplier") or ""
             site = clean_row.get("site") or clean_row.get("storage_site") or ""
-            description_text = f"{vendor} | Site: {site}" if site else vendor
 
             exists = db.query(models.Item).filter(models.Item.item_code == item_code).first()
             if exists:
                 exists.name = name
                 exists.current_stock = initial_stock
                 exists.price = price
-                exists.description = description_text
+                if hasattr(exists, 'supplier'): exists.supplier = vendor
+                if hasattr(exists, 'storage_site'): exists.storage_site = site
                 updated_count += 1
             else:
-                db.add(models.Item(
+                new_item = models.Item(
                     name=name,
                     item_code=item_code,
                     current_stock=initial_stock,
                     price=price,
-                    description=description_text,
                     minimum_stock=5
-                ))
+                )
+                if hasattr(new_item, 'supplier'): new_item.supplier = vendor
+                if hasattr(new_item, 'storage_site'): new_item.storage_site = site
+                
+                db.add(new_item)
                 added_count += 1
 
         db.commit()
@@ -284,6 +466,476 @@ async def items_bulk_import(
         db.rollback()
         print(f"[Bulk Import Critical Exception]: {str(e)}")
         return HTMLResponse(f"<script>alert('Import processing error: {str(e)}'); window.location='/';</script>")
+
+
+@app.post("/items/add")
+def add_item(
+    name: str = Form(...),
+    item_code: str = Form(...),
+    price: float = Form(0.0),
+    initial_stock: int = Form(0),  # Fixed signature mapping to HTML key
+    minimum_stock: int = Form(0),
+    db: Session = Depends(get_db)
+):
+    existing_item = db.query(models.Item).filter(models.Item.item_code == item_code).first()
+    if existing_item:
+        raise HTTPException(status_code=400, detail="Item code already exists!")
+
+    db_item = models.Item(
+        name=name,
+        item_code=item_code,
+        price=price,
+        current_stock=initial_stock,
+        minimum_stock=minimum_stock
+    )
+    db.add(db_item)
+    db.flush()
+
+    if initial_stock > 0:
+        item_unit_price = price if price is not None else 0.0
+        initial_transaction = models.Transaction(
+            item_id=db_item.id,
+            type="IN",
+            quantity=initial_stock,
+            user_id=1,
+            total_value=float(initial_stock * item_unit_price)
+        )
+        db.add(initial_transaction)
+
+    db.commit()
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/items/edit/{item_id}")
+def edit_item(
+    item_id: int,
+    name: str = Form(...),
+    item_code: str = Form(...),  # Explicitly accept the form field data
+    current_stock: int = Form(...),
+    minimum_stock: int = Form(...),
+    price: float = Form(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    if current_user.role != "Admin":
+        return HTMLResponse("<html><body><h2>Access Denied: Admin privileges required</h2></body></html>", status_code=403)
+        
+    # Changed models.InventoryItem to models.Item to match your schema definitions
+    db_item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    if not db_item:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    # Check if the new item_code is already used by a DIFFERENT item
+    duplicate = db.query(models.Item).filter(
+        models.Item.item_code == item_code.strip().upper(),
+        models.Item.id != item_id
+    ).first()
+    if duplicate:
+        return HTMLResponse(
+            f"<script>alert('Error: Item code \"{item_code.upper()}\" is already assigned to another item. Please use a unique code.'); window.history.back();</script>"
+        )
+
+    db_item.name = name
+    db_item.item_code = item_code.strip().upper()
+    db_item.current_stock = current_stock
+    db_item.minimum_stock = minimum_stock
+    db_item.price = price
+    db.commit()
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/items/delete/{item_id}")
+def delete_item(item_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user or current_user.role != "Admin":
+        return HTMLResponse("Access Denied", status_code=403)
+    db.query(models.Transaction).filter(models.Transaction.item_id == item_id).delete()
+    db.query(models.ProcurementRequest).filter(models.ProcurementRequest.item_id == item_id).delete()
+    db.query(models.MaterialAssignment).filter(models.MaterialAssignment.item_id == item_id).delete()
+    db.query(models.Item).filter(models.Item.id == item_id).delete()
+    db.commit()
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/items/update-stock-direct/{item_id}")
+def update_stock_direct(
+    item_id: int,
+    new_stock: int = Form(...),
+    session_user: str = Cookie(None),
+    db: Session = Depends(get_db)
+):
+    if not session_user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    if item:
+        item.current_stock = int(new_stock)
+        db.commit()
+        
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/material/issue")
+async def issue_materials(
+    item_id: int = Form(...),
+    quantity: int = Form(...),
+    uom: str = Form(...),
+    issued_to: str = Form(...),
+    issued_by: str = Form(...),
+    department: str = Form("General Operations"),
+    remarks: str = Form(None),
+    mis_file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    # MIS upload is mandatory to proceed
+    if not mis_file or not mis_file.filename:
+        return HTMLResponse("<script>alert('MIS (Material Issue Slip) upload is mandatory before recording an issue.'); window.history.back();</script>")
+
+    item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    if not item or item.current_stock < quantity:
+        return RedirectResponse(url="/?error=insufficient_stock", status_code=303)
+
+    # Save MIS file to disk
+    import os, datetime as dt
+    mis_dir = "mis_uploads"
+    os.makedirs(mis_dir, exist_ok=True)
+    timestamp_str = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_filename = f"MIS_{item.item_code}_{timestamp_str}_{mis_file.filename.replace(' ', '_')}"
+    mis_path = os.path.join(mis_dir, safe_filename)
+    contents = await mis_file.read()
+    with open(mis_path, "wb") as f:
+        f.write(contents)
+
+    item.current_stock -= quantity
+
+    now = dt.datetime.utcnow()
+    new_assignment = models.MaterialAssignment(
+        item_id=item_id,
+        quantity=quantity,
+        uom=uom,
+        issued_to=issued_to,
+        issued_by=issued_by,
+        department=department,
+        remarks=remarks,
+        custodian=issued_to,
+        mis_filename=safe_filename,
+        mis_uploaded_by_id=current_user.id,
+        mis_upload_timestamp=now,
+        timestamp=now
+    )
+    db.add(new_assignment)
+    db.commit()
+    return RedirectResponse(url="/?tab=allocations", status_code=303)
+
+
+@app.post("/procurement/request")
+def create_procurement_request(
+    item_id: str = Form(...),
+    quantity: int = Form(...),
+    department: str = Form(...),
+    new_item_name: str = Form(None),
+    detailed_specification: str = Form(None),
+    db: Session = Depends(get_db),
+    user_str: str = Cookie(None, alias="session_user")
+):
+    if not user_str:
+        return RedirectResponse(url="/login", status_code=303)
+    
+    current_user = db.query(models.User).filter(models.User.username == user_str).first()
+    
+    new_request = models.ProcurementRequest(
+        quantity=quantity,
+        department=department.strip(),
+        requested_by_id=current_user.id,
+        status="Pending"
+    )
+
+    if item_id == "NEW_PROCUREMENT_AD_HOC":
+        new_request.is_new_item = True
+        new_request.item_id = None
+        new_request.new_item_name = new_item_name.strip() if new_item_name else "Unlisted Item"
+        new_request.detailed_specification = detailed_specification.strip() if detailed_specification else "No specs"
+        new_request.total_estimated_cost = 0.0
+    else:
+        item_ent = db.query(models.Item).filter(models.Item.id == int(item_id)).first()
+        if not item_ent:
+            return HTMLResponse("<h2>Error: Item not found in Catalog</h2>", status_code=400)
+        
+        new_request.is_new_item = False
+        new_request.item_id = item_ent.id
+        new_request.total_estimated_cost = float(item_ent.price * quantity)
+
+    db.add(new_request)
+    db.commit()
+    return RedirectResponse(url="/#requisitions-panel", status_code=303)
+
+
+@app.post("/procurement/assign-code/{req_id}")
+def assign_item_code(
+    req_id: int,
+    new_item_code: str = Form(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user or current_user.role != "Admin":
+        return HTMLResponse("Unauthorized", status_code=403)
+
+    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == req_id).first()
+    if not req:
+        return HTMLResponse("<script>alert('Request not found.'); window.history.back();</script>")
+
+    clean_code = new_item_code.strip().upper()
+
+    # Check uniqueness against existing catalog items
+    duplicate = db.query(models.Item).filter(models.Item.item_code == clean_code).first()
+    if duplicate:
+        return HTMLResponse(
+            f"<script>alert('Error: Code \"{clean_code}\" already exists in catalog for \"{duplicate.name}\". Please use a unique code.'); window.history.back();</script>"
+        )
+
+    # Store assigned code in the supplier field of the pending request (reuse unused nullable field)
+    # We prefix it clearly so Accept logic can detect and extract it
+    req.new_item_name = f"[CODE:{clean_code}]{req.new_item_name.split(']', 1)[-1] if ']' in (req.new_item_name or '') else (req.new_item_name or '')}"
+    db.commit()
+    return RedirectResponse(url="/#requisitions-panel", status_code=303)
+
+
+
+@app.post("/procurement/assign-spec/{req_id}")
+def assign_specification(
+    req_id: int,
+    specification: str = Form(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == req_id).first()
+    if not req:
+        return HTMLResponse("<script>alert('Request not found.'); window.history.back();</script>")
+
+    clean_spec = specification.strip()
+    if not clean_spec:
+        return HTMLResponse("<script>alert('Specification cannot be empty.'); window.history.back();</script>")
+
+    req.detailed_specification = clean_spec
+    db.commit()
+    return RedirectResponse(url="/#requisitions-panel", status_code=303)
+
+
+
+@app.post("/procurement/message/{req_id}")
+def post_procurement_message(
+    req_id: int,
+    message: str = Form(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == req_id).first()
+    if not req:
+        return HTMLResponse("<script>alert('Request not found.'); window.history.back();</script>")
+    msg = models.ProcurementMessage(
+        request_id=req_id,
+        sender_id=current_user.id,
+        message=message.strip()
+    )
+    db.add(msg)
+    db.commit()
+    return RedirectResponse(url="/#requisitions-panel", status_code=303)
+
+
+@app.get("/procurement/bulk-template")
+def procurement_bulk_template(current_user: models.User = Depends(get_current_user)):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    from fastapi.responses import StreamingResponse
+    import io
+    csv_content = "item_id_or_NEW,item_name,specification,quantity,department\n"
+    csv_content += "1,,(leave blank for existing items),5,Operations\n"
+    csv_content += "NEW,Steel Pipe 25mm,Grade A - 25mm dia x 6m length - IS 1239,10,Mechanical\n"
+    return StreamingResponse(
+        io.StringIO(csv_content),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=EIPL_Procurement_Indent_Template.csv"}
+    )
+
+
+@app.post("/procurement/bulk-import")
+async def procurement_bulk_import(
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    try:
+        contents = await file.read()
+        try:
+            decoded = contents.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            decoded = contents.decode('latin-1')
+        lines = decoded.splitlines()
+        reader = csv.DictReader(lines)
+        added = 0
+        for row in reader:
+            clean = {str(k).strip().lower(): str(v).strip() for k, v in row.items() if k}
+            item_ref = clean.get("item_id_or_new", "").upper()
+            quantity_raw = clean.get("quantity", "1")
+            department = clean.get("department", "General Operations")
+            try:
+                quantity = int(float(quantity_raw))
+            except ValueError:
+                continue
+            if quantity < 1:
+                continue
+            new_req = models.ProcurementRequest(
+                quantity=quantity,
+                department=department.strip(),
+                requested_by_id=current_user.id,
+                status="Pending",
+                total_estimated_cost=0.0
+            )
+            if item_ref == "NEW":
+                new_req.is_new_item = True
+                new_req.item_id = None
+                new_req.new_item_name = clean.get("item_name", "Unlisted Item").strip() or "Unlisted Item"
+                new_req.detailed_specification = clean.get("specification", "No specs").strip() or "No specs"
+            else:
+                try:
+                    item_id = int(item_ref)
+                    item_ent = db.query(models.Item).filter(models.Item.id == item_id).first()
+                    if not item_ent:
+                        continue
+                    new_req.is_new_item = False
+                    new_req.item_id = item_ent.id
+                    new_req.total_estimated_cost = float(item_ent.price * quantity)
+                except ValueError:
+                    continue
+            db.add(new_req)
+            added += 1
+        db.commit()
+        return HTMLResponse(f"<script>alert('Bulk Import Complete! {added} indent(s) created.'); window.location='/#requisitions-panel';</script>")
+    except Exception as e:
+        db.rollback()
+        return HTMLResponse(f"<script>alert('Import error: {str(e)}'); window.history.back();</script>")
+
+
+@app.post("/procurement/action/{req_id}/{action_token}")
+def handle_procurement_action(
+    req_id: int,
+    action_token: str,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user or current_user.role != "Admin":
+        return HTMLResponse("Unauthorized", status_code=403)
+
+    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == req_id).first()
+    if req:
+        if action_token.lower() == "accept":
+            # Block Accept for new items that haven't had a code assigned yet
+            if getattr(req, 'is_new_item', False) and req.item_id is None:
+                raw_name = req.new_item_name or ""
+                if not raw_name.startswith("[CODE:"):
+                    return HTMLResponse(
+                        "<script>alert('Cannot approve: Please assign a unique Item Code to this new item request before approving.'); window.history.back();</script>"
+                    )
+                # Check specification is filled
+                raw_spec = req.detailed_specification or ""
+                if not raw_spec.strip() or raw_spec.strip().lower() == "no specs":
+                    return HTMLResponse(
+                        "<script>alert('Cannot approve: Please add the item specification before approving.'); window.history.back();</script>"
+                    )
+                # Extract the assigned code and the real item name
+                code_part = raw_name[len("[CODE:"):raw_name.index("]")]
+                real_name = raw_name[raw_name.index("]") + 1:].strip() or "New Procured Item"
+                assigned_code = code_part.strip().upper()
+            
+            req.status = "Accepted"
+            
+            # Smart Check: If it was an unlisted ad-hoc requisition item, convert it to a core catalog product line
+            if getattr(req, 'is_new_item', False) and req.item_id is None:
+                new_catalog_item = models.Item(
+                    item_code=assigned_code,
+                    name=real_name,
+                    description=req.detailed_specification,
+                    category="Procured Items",
+                    supplier="Pending Selection",
+                    storage_site=req.department,
+                    price=0.0,
+                    current_stock=req.quantity,
+                    minimum_stock=0
+                )
+                db.add(new_catalog_item)
+                db.flush()
+                req.item_id = new_catalog_item.id
+            else:
+                # Standard catalog item: directly increase stock levels 
+                if req.item:
+                    req.item.current_stock += req.quantity
+            
+            # Post transaction record to ledger history tracking
+            db.add(models.Transaction(
+                item_id=req.item_id,
+                type="IN_PO",
+                quantity=req.quantity,
+                user_id=current_user.id,
+                total_value=req.total_estimated_cost
+            ))
+        else:
+            req.status = "Rejected"
+        db.commit()
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/procurement/edit/{request_id}")
+def edit_procurement_request(
+    request_id: int,
+    item_id: int = Form(...),
+    quantity: int = Form(...),
+    department: str = Form(...),
+    session_user: str = Cookie(None),
+    db: Session = Depends(get_db)
+):
+    if not session_user:
+        return RedirectResponse(url="/login", status_code=303)
+        
+    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == request_id).first()
+    if not req:
+        return RedirectResponse(url="/", status_code=303)
+        
+    item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    if item:
+        req.item_id = item_id
+        req.quantity = quantity
+        req.total_estimated_cost = float(quantity * item.price)
+        req.department = department
+        db.commit()
+        
+    return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/procurement/delete/{request_id}")
+def delete_procurement_request(
+    request_id: int,
+    session_user: str = Cookie(None),
+    db: Session = Depends(get_db)
+):
+    if not session_user:
+        return RedirectResponse(url="/login", status_code=303)
+        
+    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == request_id).first()
+    if req:
+        db.delete(req)
+        db.commit()
+        
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.post("/admin/users/create")
@@ -350,397 +1002,6 @@ def admin_delete_user(target_id: int, current_user: models.User = Depends(get_cu
     return RedirectResponse(url="/", status_code=303)
 
 
-from fastapi import HTTPException, status
-from fastapi.responses import RedirectResponse
-
-@app.post("/items/add")
-def add_item(
-    name: str = Form(...),
-    item_code: str = Form(...),
-    price: float = Form(0.0),
-    current_stock: int = Form(0),  # Or initial_stock depending on what you used
-    minimum_stock: int = Form(0),
-    db: Session = Depends(get_db)
-):
-    # Check for duplicate item code
-    existing_item = db.query(models.Item).filter(models.Item.item_code == item_code).first()
-    if existing_item:
-        raise HTTPException(status_code=400, detail="Item code already exists!")
-
-    # 1. Create the new item
-    db_item = models.Item(
-        name=name,
-        item_code=item_code,
-        price=price,
-        current_stock=current_stock,
-        minimum_stock=minimum_stock
-    )
-    db.add(db_item)
-    db.flush()  # Generates the item ID safely
-
-    # 2. Add an opening stock transaction record WITHOUT the invalid 'remarks' field
-    if current_stock > 0:
-        item_unit_price = price if price is not None else 0.0
-        initial_transaction = models.Transaction(
-            item_id=db_item.id,
-            type="IN",                                # Matches your 'IN' operational token
-            quantity=current_stock,
-            user_id=1,                                # Default to your system admin/first user ID
-            total_value=float(current_stock * item_unit_price) # Matches your pricing calculation
-        )
-        db.add(initial_transaction)
-
-    db.commit()
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.post("/items/bulk-import")
-async def items_bulk_import(
-    file: UploadFile = File(...),
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    if not current_user or current_user.role != "Admin":
-        return HTMLResponse("Access Denied", status_code=403)
-
-    try:
-        contents = await file.read()
-        if not contents:
-            return HTMLResponse("<script>alert('Error: Uploaded file is empty.'); window.location='/';</script>")
-            
-        try:
-            decoded_content = contents.decode('utf-8-sig')
-        except UnicodeDecodeError:
-            try:
-                decoded_content = contents.decode('cp1252')
-            except UnicodeDecodeError:
-                decoded_content = contents.decode('latin-1')
-
-        clean_lines = decoded_content.splitlines()
-        
-        try:
-            sample_data = "\n".join(clean_lines[:5])
-            dialect = csv.Sniffer().sniff(sample_data)
-            if dialect.delimiter not in [',', ';', '\t', '|']:
-                dialect.delimiter = ','
-            reader = csv.DictReader(clean_lines, dialect=dialect)
-        except Exception:
-            reader = csv.DictReader(clean_lines)
-
-        added_count = 0
-        updated_count = 0
-        row_index = 0
-
-        for row in reader:
-            row_index += 1
-            if not row:
-                continue
-                
-            clean_row = {str(k).strip().lower(): str(v).strip() for k, v in row.items() if k is not None}
-
-            name = clean_row.get("name") or clean_row.get("item name") or clean_row.get("item_name")
-            item_code = clean_row.get("item_code") or clean_row.get("code") or clean_row.get("item code")
-
-            if not name or not item_code:
-                continue
-
-            item_code = item_code.upper()
-
-            try:
-                stock_raw = clean_row.get("initial_stock") or clean_row.get("stock") or clean_row.get("current_stock") or clean_row.get("quantity") or "0"
-                initial_stock = int(float(stock_raw))
-
-                price_raw = clean_row.get("price") or clean_row.get("rate") or "0.0"
-                price = float(price_raw)
-            except ValueError:
-                continue
-
-            vendor = clean_row.get("vendor") or clean_row.get("supplier") or ""
-            site = clean_row.get("site") or clean_row.get("storage_site") or ""
-
-            exists = db.query(models.Item).filter(models.Item.item_code == item_code).first()
-            if exists:
-                exists.name = name
-                exists.current_stock = initial_stock
-                exists.price = price
-                if hasattr(exists, 'supplier'): exists.supplier = vendor
-                if hasattr(exists, 'storage_site'): exists.storage_site = site
-                updated_count += 1
-            else:
-                new_item = models.Item(
-                    name=name,
-                    item_code=item_code,
-                    current_stock=initial_stock,
-                    price=price,
-                    minimum_stock=5
-                )
-                if hasattr(new_item, 'supplier'): new_item.supplier = vendor
-                if hasattr(new_item, 'storage_site'): new_item.storage_site = site
-                
-                db.add(new_item)
-                added_count += 1
-
-        db.commit()
-        return HTMLResponse(f"<script>alert('Bulk Process Complete! Added: {added_count}, Updated: {updated_count}'); window.location='/';</script>")
-        
-    except Exception as e:
-        db.rollback()
-        print(f"[Bulk Import Critical Exception]: {str(e)}")
-        return HTMLResponse(f"<script>alert('Import processing error: {str(e)}'); window.location='/';</script>")
-
-
-@app.post("/items/edit/{item_id}")
-def edit_item(
-    item_id: int,
-    name: str = Form(...),
-    item_code: str = Form(...),
-    current_stock: int = Form(...),
-    minimum_stock: int = Form(...),
-    price: float = Form(...),
-    session_user: str = Cookie(None),
-    db: Session = Depends(get_db)
-):
-    if not session_user:
-        return RedirectResponse(url="/login", status_code=303)
-
-    item = db.query(models.Item).filter(models.Item.id == item_id).first()
-    if item:
-        item.name = name.strip()
-        item.item_code = item_code.strip().upper()
-        item.current_stock = int(current_stock)
-        item.minimum_stock = int(minimum_stock)
-        item.price = float(price)
-        
-        db.commit()
-        db.refresh(item)
-        
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.post("/items/delete/{item_id}")
-def delete_item(item_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if not current_user or current_user.role != "Admin":
-        return HTMLResponse("Access Denied", status_code=403)
-    db.query(models.Transaction).filter(models.Transaction.item_id == item_id).delete()
-    db.query(models.ProcurementRequest).filter(models.ProcurementRequest.item_id == item_id).delete()
-    db.query(models.MaterialAssignment).filter(models.MaterialAssignment.item_id == item_id).delete()
-    db.query(models.Item).filter(models.Item.id == item_id).delete()
-    db.commit()
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.post("/items/update-stock-direct/{item_id}")
-def update_stock_direct(
-    item_id: int,
-    new_stock: int = Form(...),
-    session_user: str = Cookie(None),
-    db: Session = Depends(get_db)
-):
-    if not session_user:
-        return RedirectResponse(url="/login", status_code=303)
-
-    item = db.query(models.Item).filter(models.Item.id == item_id).first()
-    if item:
-        # Directly overwrite the inventory value to match exactly what you typed
-        item.current_stock = int(new_stock)
-        db.commit()
-        db.refresh(item)
-        
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.post("/material/issue")
-def issue_materials(
-    item_id: int = Form(...),
-    quantity: int = Form(...),
-    uom: str = Form(...),
-    issued_to: str = Form(...),
-    issued_by: str = Form(...),
-    remarks: str = Form(None),
-    db: Session = Depends(get_db)
-):
-    # Fetch the item
-    item = db.query(models.Item).filter(models.Item.id == item_id).first()
-    if not item or item.current_stock < quantity:
-        return RedirectResponse(url="/?error=insufficient_stock", status_code=303)
-
-    # Deduct stock
-    item.current_stock -= quantity
-
-    # Create assignment record using your exact existing structure fields
-    new_assignment = models.MaterialAssignment(
-        item_id=item_id,
-        quantity=quantity,
-        uom=uom,
-        issued_to=issued_to,
-        issued_by=issued_by,
-        remarks=remarks,
-        custodian=issued_to # This maps directly into the Excel custodian structure automatically!
-    )
-    db.add(new_assignment)
-    db.commit()
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.post("/procurement/edit/{req_id}")
-def edit_procurement_request(
-    req_id: int,
-    quantity: int = Form(...),
-    department: str = Form(...),
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    if not current_user:
-        return RedirectResponse(url="/login", status_code=303)
-
-    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == req_id).first()
-    if not req:
-        return HTMLResponse("<script>alert('Error: Request not found.'); window.location='/';</script>")
-    
-    # Only allow edits if the request is still Pending
-    if req.status != "Pending":
-        return HTMLResponse("<script>alert('Error: Cannot edit an already processed request.'); window.location='/';</script>")
-
-    # Enforce rules: Requesters can edit their own; Admins can edit any pending request
-    if current_user.role != "Admin" and req.requested_by_id != current_user.id:
-        return HTMLResponse("<script>alert('Unauthorized: You can only edit your own requests.'); window.location='/';</script>")
-
-    req.quantity = quantity
-    req.department = department.strip()
-    
-    # Recalculate estimated cost based on the item rate
-    rate = req.item.price if (req.item and req.item.price) else 0.0
-    req.total_estimated_cost = float(quantity * rate)
-    
-    db.commit()
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.post("/procurement/request")
-def create_procurement_request(
-    item_id: int = Form(...),
-    quantity: int = Form(...),
-    department: str = Form("Operations"),  # Captured Department
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    if not current_user:
-        return RedirectResponse(url="/login", status_code=303)
-
-    item = db.query(models.Item).filter(models.Item.id == item_id).first()
-    rate = item.price if (item and item.price) else 0.0
-    db.add(models.ProcurementRequest(
-        item_id=item_id,
-        quantity=quantity,
-        total_estimated_cost=float(quantity * rate),
-        requested_by_id=current_user.id,
-        department=department.strip(),
-        status="Pending"
-    ))
-    db.commit()
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.post("/procurement/action/{req_id}/{action_token}")
-def handle_procurement_action(
-    req_id: int,
-    action_token: str,
-    current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    if not current_user or current_user.role != "Admin":
-        return HTMLResponse("Unauthorized", status_code=403)
-
-    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == req_id).first()
-    if req:
-        if action_token.lower() == "accept":
-            req.status = "Accepted"
-            if req.item:
-                req.item.current_stock += req.quantity
-                db.add(models.Transaction(
-                    item_id=req.item_id,
-                    type="IN_PO",
-                    quantity=req.quantity,
-                    user_id=current_user.id,
-                    total_value=req.total_estimated_cost
-                ))
-        else:
-            req.status = "Rejected"
-        db.commit()
-    return RedirectResponse(url="/", status_code=303)
-
-
-# -------------------------------------------------------------
-# MATERIAL REQUEST MODIFICATION & REMOVAL CONTROLLERS
-# -------------------------------------------------------------
-
-@app.post("/procurement/edit/{request_id}")
-def edit_procurement_request(
-    request_id: int,
-    item_id: int = Form(...),
-    quantity: int = Form(...),
-    department: str = Form(...),
-    session_user: str = Cookie(None),
-    db: Session = Depends(get_db)
-):
-    if not session_user:
-        return RedirectResponse(url="/login", status_code=303)
-        
-    # Fetch the request row
-    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == request_id).first()
-    if not req:
-        return RedirectResponse(url="/", status_code=303)
-        
-    # Fetch the chosen item to re-calculate estimated costs dynamically
-    item = db.query(models.Item).filter(models.Item.id == item_id).first()
-    if item:
-        req.item_id = item_id
-        req.quantity = quantity
-        req.total_estimated_cost = float(quantity * item.price)
-        req.department = department
-        db.commit()
-        
-    return RedirectResponse(url="/", status_code=303)
-
-
-# -------------------------------------------------------------
-# PROCUREMENT REQUEST DELETION ENDPOINT
-# -------------------------------------------------------------
-@app.get("/procurement/delete/{req_id}")
-def delete_procurement_request(
-    req_id: int,
-    session_user: str = Cookie(None),
-    db: Session = Depends(get_db)
-):
-    if not session_user:
-        return RedirectResponse(url="/login", status_code=303)
-        
-    r = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == req_id).first()
-    if r:
-        db.delete(r)
-        db.commit()
-        
-    return RedirectResponse(url="/", status_code=303)
-
-
-@app.get("/procurement/delete/{request_id}")
-def delete_procurement_request(
-    request_id: int,
-    session_user: str = Cookie(None),
-    db: Session = Depends(get_db)
-):
-    if not session_user:
-        return RedirectResponse(url="/login", status_code=303)
-        
-    # Fetch and remove the request entry
-    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == request_id).first()
-    if req:
-        db.delete(req)
-        db.commit()
-        
-    return RedirectResponse(url="/", status_code=303)
-
-
 @app.post("/employees/add")
 def add_employee(
     name: str = Form(...),
@@ -802,7 +1063,6 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         return RedirectResponse(url="/login", status_code=303)
 
     items = db.query(models.Item).all()
-    reqs = db.query(models.ProcurementRequest).all()
     assignments = db.query(models.MaterialAssignment).all()
     employees = db.query(models.Employee).all()
     users = db.query(models.User).all()
@@ -810,71 +1070,143 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
     item_options = "".join([f'<option value="{i.id}">{i.name} ({i.item_code})</option>' for i in items])
     employee_options = "".join([f'<option value="{e.name}">{e.name} - {e.role_title}</option>' for e in employees])
 
-
+    # 1. FIXED MODAL SCRIPT ENGINE BLOCK WITH ADDED DEPARTMENT INPUT
     inventory_rows = """
     <script>
-    if (!window.openEditItemModalDefined) {
-        window.openEditItemModal = function(id, name, item_code, current_stock, minimum_stock, price) {
-            let modal = document.getElementById('dynamicEditItemModal');
-            if (!modal) {
-                modal = document.createElement('div');
-                modal.id = 'dynamicEditItemModal';
-                modal.className = 'fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50';
-                document.body.appendChild(modal);
-            }
-            modal.innerHTML = `
-                <div class="bg-white rounded-xl border border-slate-200 shadow-2xl w-full max-w-md p-6 text-left relative animate-in fade-in zoom-in-95 duration-150" style="font-family: inherit; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);">
-                    <h3 class="text-lg font-bold text-slate-900 mb-4 flex items-center gap-2" style="font-size: 1.125rem; font-weight: 700; color: #0f172a; margin-bottom: 1rem;">📝 Edit Inventory Item</h3>
-                    
-                    <form action="/items/edit/${id}" method="POST" style="display: flex; flex-direction: column; gap: 1rem;">
+    // 1. THE CORRECTED PROCUREMENT REQUEST MODAL ENGINE
+    window.openProcurementModal = function(id, name, item_code) {
+        let modal = document.getElementById('dynamicProcurementModal');
+        if (!modal) {
+            modal = document.createElement('div');
+            modal.id = 'dynamicProcurementModal';
+            modal.className = 'fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50';
+            document.body.appendChild(modal);
+        }
+        modal.innerHTML = `
+            <div class="bg-white rounded-xl border border-slate-200 shadow-2xl w-full max-w-md p-6 text-left relative">
+                <h3 class="text-lg font-bold text-slate-900 mb-4 flex items-center gap-2" style="font-size: 1.125rem; font-weight: 700; color: #0f172a; margin-bottom: 1rem;">📋 Create Procurement Request</h3>
+                <form action="/procurement/request" method="POST" style="display: flex; flex-direction: column; gap: 1rem;">
+                    <input type="hidden" name="item_id" value="` + id + `">
+                    <div>
+                        <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Item Name</label>
+                        <input type="text" value="` + name + `" readonly style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; color: #64748b; background-color: #f8fafc;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Item Code</label>
+                        <input type="text" value="` + item_code + `" readonly style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #64748b; background-color: #f8fafc;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Target Department</label>
+                        <select name="department" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; color: #0f172a; background-color: #ffffff;">
+                            <option value="Operations">Operations</option>
+                            <option value="Mechanical">Mechanical</option>
+                            <option value="Electrical">Electrical</option>
+                            <option value="Commercial">Commercial</option>
+                            <option value="Stores">Stores</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Quantity Required</label>
+                        <input type="number" name="quantity" min="1" value="1" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem;">
+                    </div>
+                    <div style="display: flex; justify-content: flex-end; gap: 0.5rem; padding-top: 0.75rem; border-top: 1px solid #e2e8f0;">
+                        <button type="button" onclick="document.getElementById('dynamicProcurementModal').remove()" style="padding: 0.5rem 1rem; font-size: 0.75rem; font-weight: 700; color: #475569; background-color: #f1f5f9; border: none; border-radius: 0.375rem; cursor: pointer;">Cancel</button>
+                        <button type="submit" style="padding: 0.5rem 1rem; font-size: 0.75rem; font-weight: 700; color: white; background-color: #4338ca; border: none; border-radius: 0.375rem; cursor: pointer;">Submit Request</button>
+                    </div>
+                </form>
+            </div>
+        `;
+    };
+
+    // 2. THE EDIT ITEM MENU
+    window.openEditItemModal = function(id, name, Unique_code, price, current_stock, minimum_stock) {
+        let modal = document.getElementById('dynamicEditItemModal');
+        if (!modal) {
+            modal = document.createElement('div');
+            modal.id = 'dynamicEditItemModal';
+            modal.className = 'fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50';
+            document.body.appendChild(modal);
+        }
+        modal.innerHTML = `
+            <div class="bg-white rounded-xl border border-slate-200 shadow-2xl w-full max-w-md p-6 text-left relative">
+                <h3 class="text-lg font-bold text-slate-900 mb-4 flex items-center gap-2" style="font-size: 1.125rem; font-weight: 700; color: #0f172a; margin-bottom: 1rem;">✏️ Edit Inventory Item</h3>
+                <form action="/items/edit/` + id + `" method="POST" style="display: flex; flex-direction: column; gap: 1rem;">
+                    <div>
+                        <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #4338ca; text-transform: uppercase; margin-bottom: 0.25rem;">✏️ Unique Code</label>
+                        <input type="text" name="item_code" value="` + Unique_code + `" required style="width: 100%; padding: 0.5rem 0.75rem; border: 2px solid #6366f1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #0f172a; background-color: #ffffff; cursor: text;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Item Name</label>
+                        <input type="text" name="name" value="` + name + `" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; color: #0f172a; background-color: #ffffff; cursor: text;">
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
                         <div>
-                            <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Item Name</label>
-                            <input type="text" name="name" value="${name.replace(/"/g, '&quot;')}" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; color: #1e293b;">
+                            <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Price (₹)</label>
+                            <input type="number" step="0.01" name="price" value="` + price + `" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #1e293b;">
                         </div>
                         <div>
-                            <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Item Code</label>
-                            <input type="text" name="item_code" value="${item_code}" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #475569; background-color: #f8fafc;">
+                            <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Safety Stock</label>
+                            <input type="number" name="minimum_stock" value="` + minimum_stock + `" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #1e293b;">
                         </div>
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-                            <div>
-                                <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Price (₹)</label>
-                                <input type="number" step="0.01" name="price" value="${price}" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #1e293b;">
-                            </div>
-                            <div>
-                                <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Safety Stock</label>
-                                <input type="number" name="minimum_stock" value="${minimum_stock}" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #1e293b;">
-                            </div>
-                        </div>
-                        <div>
-                            <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Current Stock Level</label>
-                            <input type="number" name="current_stock" value="${current_stock}" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #1e293b;">
-                        </div>
-                        
-                        <div style="display: flex; justify-content: flex-end; gap: 0.5rem; padding-top: 0.75rem; border-top: 1px solid #e2e8f0; margin-top: 0.5rem;">
-                            <button type="button" onclick="document.getElementById('dynamicEditItemModal').remove()" style="padding: 0.5rem 1rem; font-size: 0.75rem; font-weight: 700; color: #475569; background-color: #f1f5f9; border: none; border-radius: 0.375rem; cursor: pointer;">Cancel</button>
-                            <button type="submit" style="padding: 0.5rem 1rem; font-size: 0.75rem; font-weight: 700; color: white; background-color: #d97706; border: none; border-radius: 0.375rem; cursor: pointer;">Save Changes</button>
-                        </div>
-                    </form>
-                </div>
-            `;
-        };
-        window.openEditItemModalDefined = true;
-    }
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Current Stock Level</label>
+                        <input type="number" name="current_stock" value="` + current_stock + `" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #1e293b;">
+                    </div>
+                    <div style="display: flex; justify-content: flex-end; gap: 0.5rem; padding-top: 0.75rem; border-top: 1px solid #e2e8f0; margin-top: 0.5rem;">
+                        <button type="button" onclick="document.getElementById('dynamicEditItemModal').remove()" style="padding: 0.5rem 1rem; font-size: 0.75rem; font-weight: 700; color: #475569; background-color: #f1f5f9; border: none; border-radius: 0.375rem; cursor: pointer;">Cancel</button>
+                        <button type="submit" style="padding: 0.5rem 1rem; font-size: 0.75rem; font-weight: 700; color: white; background-color: #d97706; border: none; border-radius: 0.375rem; cursor: pointer;">Save Changes</button>
+                    </div>
+                </form>
+            </div>
+        `;
+    };
     </script>
     """
+
     for it in items:
         alert_status = ""
         if it.current_stock <= it.minimum_stock:
-            alert_status = ' <span class="text-rose-600 font-black animate-pulse">⚠️ LOW</span>'
+            alert_status = ' <span class="text-rose-600 font-black animate-pulse">&#9888;&#65039; LOW</span>'
         
-        # Pull spreadsheet metadata attributes safely
         item_cat = getattr(it, 'category', 'Consumables')
         item_sup = getattr(it, 'supplier', 'EIPL Approved Vendor')
         item_site = getattr(it, 'storage_site', 'Store Yard')
 
-        # Strictly clean text fields to prevent quote collisions
-        safe_name = it.name.replace("'", "\\'").replace('"', '\\"')
-        safe_code = it.item_code.replace("'", "\\'").replace('"', '\\"')
+        import html as _html
+        h_name = _html.escape(it.name, quote=True)
+        h_code = _html.escape(it.item_code, quote=True)
+
+        if current_user.role == "Admin":
+            admin_only_cells = f"""
+            <td class="p-3 text-slate-600 text-[11px] font-medium">{item_sup}</td>
+            <td class="p-3 font-mono text-slate-600">&#8377;{it.price:,.2f}</td>"""
+            action_cell = f"""
+            <td class="p-3">
+                <div class="flex items-center gap-2">
+                    <button type="button"
+                        data-action="procure"
+                        data-id="{it.id}" data-name="{h_name}" data-code="{h_code}"
+                        class="text-indigo-600 hover:underline font-bold text-[11px]">Procure</button>
+                    <button type="button"
+                        data-action="edit-item"
+                        data-id="{it.id}" data-name="{h_name}" data-code="{h_code}"
+                        data-price="{it.price}" data-stock="{it.current_stock}" data-minstock="{it.minimum_stock}"
+                        class="text-amber-600 hover:underline font-bold text-[11px]">Edit</button>
+                    <form action="/items/delete/{it.id}" method="POST" onsubmit="return confirm('Remove this item?');" class="inline m-0">
+                        <button type="submit" class="text-rose-600 hover:underline font-bold text-[11px] bg-transparent border-none p-0 cursor-pointer inline">Delete</button>
+                    </form>
+                </div>
+            </td>"""
+        else:
+            admin_only_cells = ""
+            action_cell = f"""
+            <td class="p-3">
+                <button type="button"
+                    data-action="procure"
+                    data-id="{it.id}" data-name="{h_name}" data-code="{h_code}"
+                    class="text-indigo-600 hover:underline font-bold text-[11px]">Procure</button>
+            </td>"""
 
         inventory_rows += f"""
         <tr class="border-b border-slate-100 hover:bg-slate-50/50">
@@ -882,60 +1214,104 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                 <span>{it.name}</span>{alert_status}
                 <div class="text-[10px] text-slate-400 mt-0.5">
                     <span class="bg-slate-100 px-1 py-0.5 rounded text-slate-600">{item_cat}</span> 
-                    • <span class="bg-blue-50 px-1 py-0.5 rounded text-blue-600">{item_site}</span>
+                    &bull; <span class="bg-blue-50 px-1 py-0.5 rounded text-blue-600">{item_site}</span>
                 </div>
             </td>
-            
             <td class="p-3 font-mono text-[11px] text-slate-500">{it.item_code}</td>
-            <td class="p-3 text-slate-600 text-[11px] font-medium">{item_sup}</td>
-            <td class="p-3 font-mono text-slate-600">₹{it.price:,.2f}</td>
+            {admin_only_cells}
             <td class="p-3 font-mono font-bold text-slate-900">{it.current_stock}</td>
             <td class="p-3 font-mono text-slate-400">{it.minimum_stock}</td>
-            
-            <td class="p-3">
-                <div class="flex items-center gap-2">
-                    <button type="button" onclick="openProcurementModal({it.id}, '{safe_name}')" class="text-indigo-600 hover:underline font-bold text-[11px]">Procure</button>
-                    
-                    <button type="button" onclick="openEditItemModal({it.id}, '{safe_name}', '{safe_code}', {it.current_stock}, {it.minimum_stock}, {it.price})" class="text-amber-600 hover:underline font-bold text-[11px]">
-                        Edit
-                    </button>
-                    
-                    <form action="/items/delete/{it.id}" method="POST" onsubmit="return confirm('Are you sure you want to completely remove this item from inventory records?');" class="inline m-0">
-                        <button type="submit" class="text-rose-600 hover:underline font-bold text-[11px] bg-transparent border-none p-0 cursor-pointer inline">
-                            Delete
-                        </button>
-                    </form>
-                </div>
-            </td>
+            {action_cell}
         </tr>
         """
 
-
     req_rows = ""
+    reqs = db.query(models.ProcurementRequest).order_by(models.ProcurementRequest.timestamp.desc()).all()
+    
     for r in reqs:
-        date_str = r.timestamp.strftime("%d-%m %H:%M")
+        date_str = r.timestamp.strftime("%d-%m %H:%M") if r.timestamp else ""
         badge = '<span class="bg-amber-100 text-amber-700 font-bold px-2 py-0.5 rounded text-[10px]">Pending</span>'
         if r.status == "Accepted":
             badge = '<span class="bg-emerald-100 text-emerald-700 font-bold px-2 py-0.5 rounded text-[10px]">Accepted</span>'
         elif r.status == "Rejected":
             badge = '<span class="bg-rose-100 text-rose-700 font-bold px-2 py-0.5 rounded text-[10px]">Rejected</span>'
 
+        # Fixed display string formatting to safely pick up ad-hoc material information
+        if getattr(r, 'is_new_item', False) and not r.item:
+            raw_name = r.new_item_name or ""
+            # Detect if code has been assigned
+            if raw_name.startswith("[CODE:"):
+                assigned_code = raw_name[len("[CODE:"):raw_name.index("]")]
+                real_display_name = raw_name[raw_name.index("]") + 1:].strip() or "New Item"
+                code_cell = f"<span class='bg-emerald-100 text-emerald-700 font-black font-mono px-2 py-0.5 rounded text-[11px] border border-emerald-200'>✓ {assigned_code}</span>"
+                code_assigned = True
+            else:
+                real_display_name = raw_name or "Unlisted Item"
+                code_cell = f"""
+                    <form action='/procurement/assign-code/{r.id}' method='POST' class='flex gap-1 items-center'>
+                        <input type='text' name='new_item_code' placeholder='e.g. EIPL-ST-09' required
+                            class='border border-amber-300 bg-amber-50 text-slate-900 font-mono text-[11px] px-2 py-1 rounded-lg w-32 uppercase focus:outline-none focus:border-indigo-500'
+                            style='text-transform:uppercase'>
+                        <button type='submit' class='bg-amber-500 hover:bg-amber-600 text-white font-bold text-[10px] px-2 py-1 rounded-lg transition-all'>Assign</button>
+                    </form>"""
+                code_assigned = False
+
+            # Detect if specification is missing
+            raw_spec = r.detailed_specification or ""
+            spec_missing = (not raw_spec.strip() or raw_spec.strip().lower() == "no specs")
+            if spec_missing:
+                spec_cell = f"""
+                    <form action='/procurement/assign-spec/{r.id}' method='POST' class='flex flex-col gap-1'>
+                        <textarea name='specification' rows='2' placeholder='Enter item specifications...' required
+                            class='border border-rose-300 bg-rose-50 text-slate-900 text-[11px] px-2 py-1 rounded-lg w-40 focus:outline-none focus:border-indigo-500 resize-none'></textarea>
+                        <button type='submit' class='bg-rose-500 hover:bg-rose-600 text-white font-bold text-[10px] px-2 py-1 rounded-lg transition-all'>Submit</button>
+                    </form>"""
+                spec_filled = False
+            else:
+                spec_cell = f"<span class='bg-emerald-100 text-emerald-700 font-bold px-2 py-0.5 rounded text-[11px] border border-emerald-200' title='{raw_spec}'>✓ Spec Added</span>"
+                spec_filled = True
+
+            item_desc_display = f"<span class='text-amber-600 font-bold'>[NEW]</span> <b>{real_display_name}</b><br><span class='text-[10px] text-slate-400 italic font-normal'>Specs: {r.detailed_specification or 'No Specs'}</span>"
+            est_value_text = "₹ TBD"
+        else:
+            item_name_str = r.item.name if r.item else (r.new_item_name or "Catalog Item Request")
+            item_code_str = f" ({r.item.item_code})" if r.item else ""
+            item_desc_display = f"<b>{item_name_str}</b>{item_code_str}"
+            est_value_text = f"₹{r.total_estimated_cost:,.2f}" if r.total_estimated_cost else "₹0.00"
+            code_cell = f"<span class='text-slate-400 text-[10px]'>—</span>"
+            spec_cell = f"<span class='text-slate-400 text-[10px]'>—</span>"
+            code_assigned = True
+            spec_filled = True  # existing items don't need spec
+
+        if getattr(r, 'department', None):
+            item_desc_display += f" <span class='text-[10px] text-indigo-600 font-semibold bg-indigo-50 px-1.5 py-0.5 rounded'>[{r.department}]</span>"
+
+        # For pending new items, only show Approve if code is assigned
         flow = ""
         if r.status == "Pending":
             edit_btn = ""
             if current_user.role == "Admin" or r.requested_by_id == current_user.id:
-                escaped_dept = r.department.replace("'", "\\'")
-                # Pass the item_id as the 4th parameter so the dropdown knows which option to highlight
+                import html as _html
+                h_dept = _html.escape(r.department or "", quote=True)
                 current_item_id = r.item_id if r.item_id else 0
-                edit_btn = f"""<button onclick="openEditRequestModal({r.id}, {r.quantity}, '{escaped_dept}', {current_item_id})" class="text-indigo-600 font-bold hover:underline text-[10px] mr-2">Edit</button>"""
+                edit_btn = f"""<button
+                    data-action="edit-request"
+                    data-id="{r.id}" data-qty="{r.quantity}" data-dept="{h_dept}" data-itemid="{current_item_id}"
+                    class="text-indigo-600 font-bold hover:underline text-[10px] mr-2">Edit</button>"""
 
             if current_user.role == "Admin":
+                if not code_assigned:
+                    approve_btn = f"""<span class='text-[10px] text-slate-400 italic'>Assign code first &#8593;</span>"""
+                elif not spec_filled:
+                    approve_btn = f"""<span class='text-[10px] text-slate-400 italic'>Add specification first &#8593;</span>"""
+                else:
+                    approve_btn = f"""<form action="/procurement/action/{r.id}/accept" method="POST" class="inline">
+                        <input type="submit" value="Approve" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-1.5 py-0.5 rounded cursor-pointer text-[10px] transition-colors">
+                    </form>"""
                 flow = f"""
                 <div class="flex items-center gap-1">
                     {edit_btn}
-                    <form action="/procurement/action/{r.id}/accept" method="POST" class="inline">
-                        <input type="submit" value="Approve" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-1.5 py-0.5 rounded cursor-pointer text-[10px] transition-colors">
-                    </form>
+                    {approve_btn}
                     <form action="/procurement/action/{r.id}/reject" method="POST" class="inline">
                         <input type="submit" value="Reject" class="bg-rose-600 hover:bg-rose-700 text-white font-bold px-1.5 py-0.5 rounded cursor-pointer text-[10px] transition-colors">
                     </form>
@@ -944,75 +1320,92 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             else:
                 flow = f"""<div class="flex items-center gap-1">{edit_btn} <span class="text-slate-400 italic text-[10px]">Awaiting Review</span></div>"""
         elif r.status == "Accepted":
-            esc_name = r.item.name.replace("'", "\\'") if r.item else "Deleted Item"
-            esc_code = r.item.item_code if r.item else "N/A"
-            flow = f"""<button onclick="triggerInlinePOPrint({r.id}, '{esc_name}', '{esc_code}', {r.quantity})" class="bg-slate-700 hover:bg-slate-800 text-white text-[10px] font-bold px-2 py-0.5 rounded tracking-wide shadow-sm transition-all">🖨️ Print PO</button>"""
+            import html as _html
+            po_name = _html.escape(r.item.name if r.item else (r.new_item_name or "Item Approved"), quote=True)
+            po_code = _html.escape(r.item.item_code if r.item else "N/A", quote=True)
+            flow = f"""<button
+                data-action="print-po"
+                data-id="{r.id}" data-name="{po_name}" data-code="{po_code}" data-qty="{r.quantity}"
+                class="bg-slate-700 hover:bg-slate-800 text-white text-[10px] font-bold px-2 py-0.5 rounded tracking-wide shadow-sm transition-all">&#128438; Print PO</button>"""
         else:
             flow = '<span class="text-slate-400 line-through text-[11px]">Closed</span>'
 
-        item_desc_display = f"{r.item.name if r.item else 'Asset Disposed'}"
-        if r.item:
-            item_desc_display += f" <span class='text-[10px] text-slate-400 font-mono'>({r.item.item_code})</span>"
-        if getattr(r, 'department', None):
-            item_desc_display += f" <span class='text-[10px] text-indigo-600 font-semibold bg-indigo-50 px-1.5 py-0.5 rounded'>[{r.department}]</span>"
+        # --- BUILD MESSAGE THREAD for this procurement request ---
+        messages = db.query(models.ProcurementMessage).filter(
+            models.ProcurementMessage.request_id == r.id
+        ).order_by(models.ProcurementMessage.timestamp.asc()).all()
 
-        req_rows += f"""<tr class="border-b hover:bg-slate-50">
-            <td class="p-3 text-slate-500 font-mono">{date_str}</td>
-            <td class="p-3 font-bold text-slate-800">{item_desc_display}</td>
-            <td class="p-3 font-mono font-semibold">{r.quantity}</td>
-            <td class="p-3 font-mono text-slate-600">₹{r.total_estimated_cost:,.2f}</td>
-            <td class="p-3 text-slate-500">{r.requester.username if r.requester else 'System'}</td>
-            <td class="p-3">{badge}</td>
-            <td class="p-3">{flow}</td>
+        msg_bubbles = ""
+        for msg in messages:
+            sender_role = msg.sender.role if msg.sender else "Staff"
+            sender_label = "Admin" if sender_role == "Admin" else msg.sender.username if msg.sender else "Staff"
+            bubble_color = "bg-indigo-50 border-indigo-100 text-indigo-900" if sender_role == "Admin" else "bg-slate-50 border-slate-200 text-slate-800"
+            label_color = "text-indigo-600" if sender_role == "Admin" else "text-slate-500"
+            msg_time = msg.timestamp.strftime("%d-%m %H:%M") if msg.timestamp else ""
+            import html as _html
+            safe_msg = _html.escape(msg.message)
+            msg_bubbles += f"""
+            <div class='border rounded-lg p-2 {bubble_color} mb-1'>
+                <div class='flex justify-between items-center mb-0.5'>
+                    <span class='font-bold text-[10px] {label_color}'>{sender_label}</span>
+                    <span class='text-[9px] text-slate-400 font-mono'>{msg_time}</span>
+                </div>
+                <p class='text-[11px] leading-snug'>{safe_msg}</p>
+            </div>"""
+
+        msg_thread_cell = f"""
+        <div class='w-52'>
+            <div class='max-h-24 overflow-y-auto mb-1.5 space-y-1 pr-0.5'>
+                {msg_bubbles if msg_bubbles else "<p class='text-[10px] text-slate-400 italic'>No messages yet.</p>"}
+            </div>
+            <form action='/procurement/message/{r.id}' method='POST' class='flex gap-1'>
+                <input type='text' name='message' placeholder='Type message...' required
+                    class='flex-1 border border-slate-200 bg-slate-50 text-[11px] px-2 py-1 rounded-lg focus:outline-none focus:border-indigo-400 min-w-0'>
+                <button type='submit' class='bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[10px] px-2 py-1 rounded-lg shrink-0'>Send</button>
+            </form>
+        </div>"""
+
+        req_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs align-top">
+            <td class="p-3 text-slate-500 font-mono whitespace-nowrap">{date_str}</td>
+            <td class="p-3 text-slate-800">{item_desc_display}</td>
+            <td class="p-3 font-mono font-semibold text-center">{r.quantity}</td>
+            <td class="p-3 font-mono text-slate-600 text-right whitespace-nowrap">{est_value_text}</td>
+            <td class="p-3">{code_cell}</td>
+            <td class="p-3">{spec_cell}</td>
+            <td class="p-3 text-slate-500 whitespace-nowrap">{r.requester.username if r.requester else 'System'}</td>
+            <td class="p-3 text-center">{badge}</td>
+            <td class="p-3">{msg_thread_cell}</td>
+            <td class="p-3 text-right">{flow}</td>
         </tr>"""
+
 
     assigned_rows = ""
     for a in assignments:
-        ts = a.timestamp.strftime("%d-%m %H:%M")
-        assigned_rows += f"""<tr class="border-b hover:bg-slate-50">
-            <td class="p-3 font-mono text-slate-400">{ts}</td>
-            <td class="p-3 font-bold text-slate-800">{a.item.name if a.item else 'Archived Asset'}</td>
-            <td class="p-3 font-mono text-blue-700 font-bold">{a.quantity} {a.uom}</td>
+        ts = a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "—"
+        item_name = a.item.name if a.item else 'Archived Asset'
+        dept = getattr(a, 'department', '—') or '—'
+        assigned_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs">
+            <td class="p-3 font-mono text-slate-400 text-[11px]">{ts}</td>
+            <td class="p-3 font-bold text-slate-800">{item_name}</td>
+            <td class="p-3 font-mono font-bold text-blue-700 text-center">{a.quantity}</td>
+            <td class="p-3 font-mono text-slate-500 text-center">{a.uom}</td>
             <td class="p-3 text-slate-700 font-medium">{a.issued_to}</td>
-            <td class="p-3 text-slate-500 font-mono">{a.issued_by}</td>
-            <td class="p-3 text-slate-500 italic text-[11px]">{a.remarks or '-'}</td>
+            <td class="p-3 text-slate-500">{dept}</td>
+            <td class="p-3 text-slate-400 italic text-[11px]">{a.remarks or '—'}</td>
         </tr>"""
 
     employee_control_panel = ""
     admin_panel = ""
     user_directory_control_panel = ""
 
-    # Generate the direct Sidebar Component for making procurement demands
-    procurement_widget_panel = f"""
-    <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-xl">
-        <h2 class="text-xs font-black tracking-wider text-slate-500 uppercase border-b border-slate-200 pb-2 mb-4">❖ Material Procurement Requisition</h2>
-        <form action="/procurement/request" method="POST" class="space-y-3 text-xs">
-            <div>
-                <label class="block font-semibold text-slate-500 mb-1">Select Item</label>
-                <select name="item_id" class="w-full bg-slate-50 border border-slate-300 text-slate-900 p-2.5 rounded-lg">{item_options}</select>
-            </div>
-            <div class="grid grid-cols-2 gap-3">
-                <div>
-                    <label class="block font-semibold text-slate-500 mb-1">Required Units</label>
-                    <input type="number" name="quantity" min="1" value="5" required class="w-full bg-slate-50 border border-slate-300 text-slate-900 p-2.5 rounded-lg">
-                </div>
-                <div>
-                    <label class="block font-semibold text-slate-500 mb-1">Department</label>
-                    <input type="text" name="department" placeholder="e.g. Mechanical, Civil" required class="w-full bg-slate-50 border border-slate-300 text-slate-900 p-2.5 rounded-lg">
-                </div>
-            </div>
-            <button type="submit" class="w-full bg-indigo-700 hover:bg-indigo-800 text-white p-2.5 rounded-lg font-bold transition-all shadow-sm">Submit Procurement Demand</button>
-        </form>
-    </div>
-    """
-
     if current_user.role == "Admin":
         employee_list_markup = ""
         for e in employees:
-            esc_emp_name = e.name.replace("'", "\\'")
-            esc_emp_role = e.role_title.replace("'", "\\'")
-            esc_emp_loc = e.location.replace("'", "\\'")
-            esc_emp_contact = e.contact.replace("'", "\\'")
+            import html as _html
+            h_emp_name    = _html.escape(e.name, quote=True)
+            h_emp_role    = _html.escape(e.role_title, quote=True)
+            h_emp_loc     = _html.escape(e.location, quote=True)
+            h_emp_contact = _html.escape(e.contact, quote=True)
             employee_list_markup += f"""
             <div class='flex items-center justify-between bg-slate-50 p-2.5 rounded-lg border border-slate-200 text-[11px]'>
                 <div class='space-y-0.5'>
@@ -1021,7 +1414,11 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                     <p class='text-slate-400 font-mono text-[9px]'>Ph: {e.contact}</p>
                 </div>
                 <div class='flex gap-1.5 ml-2'>
-                    <button type='button' onclick="openEditEmployeeModal({e.id}, '{esc_emp_name}', '{esc_emp_role}', '{esc_emp_loc}', '{esc_emp_contact}')" class='text-indigo-600 font-bold hover:underline text-[10px]'>edit</button>
+                    <button type='button'
+                        data-action="edit-employee"
+                        data-id="{e.id}" data-name="{h_emp_name}" data-role="{h_emp_role}"
+                        data-loc="{h_emp_loc}" data-contact="{h_emp_contact}"
+                        class='text-indigo-600 font-bold hover:underline text-[10px]'>edit</button>
                     <form action='/employees/delete/{e.id}' method='POST' class='inline'><input type='submit' value='delete' class='text-rose-500 font-bold cursor-pointer hover:underline bg-transparent border-0 text-[10px]'></form>
                 </div>
             </div>"""
@@ -1046,7 +1443,6 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-xl mb-6">
             <div class="flex items-center justify-between border-b pb-2 mb-4">
                 <h2 class="text-xs font-black tracking-wider text-slate-500 uppercase">❖ Update Item Manually</h2>
-                <button type="button" onclick="downloadItemsCSVTemplate()" class="text-[10px] text-indigo-600 hover:underline font-bold">📥 Get Template</button>
             </div>
             <form action="/items/add" method="POST" class="space-y-3 text-xs">
                 <div class="grid grid-cols-2 gap-3">
@@ -1091,9 +1487,10 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
 
         user_list_markup = ""
         for u in users:
-            esc_name = u.full_name.replace("'", "\\'")
-            esc_desig = u.designation.replace("'", "\\'")
-            esc_loc = u.workstation_location.replace("'", "\\'")
+            import html as _html
+            h_uname = _html.escape(u.full_name, quote=True)
+            h_desig = _html.escape(u.designation, quote=True)
+            h_loc   = _html.escape(u.workstation_location, quote=True)
             user_list_markup += f"""
             <div class='flex items-center justify-between bg-slate-50 p-2.5 rounded-lg border border-slate-200 text-[11px]'>
                 <div>
@@ -1101,7 +1498,11 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                     <p class='text-slate-500 text-[10px]'>{u.full_name} - {u.designation}</p>
                 </div>
                 <div class='flex gap-1.5'>
-                    <button type='button' onclick="openEditUserModal({u.id}, '{esc_name}', '{esc_desig}', '{esc_loc}', '{u.role}')" class='text-indigo-600 font-bold hover:underline text-[10px]'>edit</button>
+                    <button type='button'
+                        data-action="edit-user"
+                        data-id="{u.id}" data-name="{h_uname}" data-desig="{h_desig}"
+                        data-loc="{h_loc}" data-role="{u.role}"
+                        class='text-indigo-600 font-bold hover:underline text-[10px]'>edit</button>
                     <form action='/admin/users/delete/{u.id}' method='POST' class='inline'><input type='submit' value='delete' class='text-rose-500 font-bold cursor-pointer hover:underline bg-transparent border-0 text-[10px]'></form>
                 </div>
             </div>"""
@@ -1126,6 +1527,12 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         </div>
         """
 
+    import json as _json
+    mis_inventory_json_safe = _json.dumps([
+        {"id": i.id, "name": i.name, "code": i.item_code, "stock": i.current_stock}
+        for i in items
+    ])
+
     return templates.LAYOUT_HTML.replace("__USER__", current_user.username)\
                                 .replace("__ROLE__", current_user.role)\
                                 .replace("__USER_FULL_NAME__", current_user.full_name)\
@@ -1134,10 +1541,11 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                                 .replace("__ADMIN_PANEL__", admin_panel)\
                                 .replace("__EMPLOYEE_CONTROL_PANEL__", employee_control_panel)\
                                 .replace("__USER_DIRECTORY_CONTROL_PANEL__", user_directory_control_panel)\
-                                .replace("__PROCUREMENT_WIDGET_PANEL__", procurement_widget_panel)\
+                                .replace("__PROCUREMENT_WIDGET_PANEL__", templates.PROCUREMENT_WIDGET_PANEL)\
                                 .replace("__OPTIONS__", item_options)\
                                 .replace("__EMPLOYEE_OPTIONS__", employee_options)\
                                 .replace("__INVENTORY_ROWS__", inventory_rows)\
                                 .replace("__REG_ROWS__", req_rows)\
-                                .replace("__ASSIGNED_ROWS__", assigned_rows)
-
+                                .replace("__ASSIGNED_ROWS__", assigned_rows)\
+                                .replace("__MIS_INVENTORY_JSON__", mis_inventory_json_safe)\
+                                .replace("__IS_ADMIN__", "true" if current_user.role == "Admin" else "false")
