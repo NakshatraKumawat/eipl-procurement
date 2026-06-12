@@ -7,9 +7,10 @@ from sqlalchemy.orm import sessionmaker
 # Otherwise, it falls back to your local offline SQLite file!
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./inventory.db")
 
-if DATABASE_URL.startswith("postgresql://"):
-    # Fixes a common SQLAlchemy compatibility quirk with newer cloud strings
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
+if DATABASE_URL.startswith("postgresql"):
+    # Handle both postgresql:// and postgresql+psycopg2:// formats
+    if not DATABASE_URL.startswith("postgresql+psycopg2://"):
+        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://")
     engine = create_engine(DATABASE_URL)
 else:
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})

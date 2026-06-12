@@ -88,13 +88,18 @@ LAYOUT_HTML = """<!DOCTYPE html>
         <nav class="flex-1 p-4 space-y-1 overflow-y-auto">
             <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2 font-semibold">Core Dashboard</p>
             
-            <button id="nav-inventory" onclick="switchTab('inventory')" class="w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left">
-                <i class="fa-solid fa-boxes-stacked w-5 text-center text-indigo-600"></i> Inventory Status
-            </button>
+            <a href="/material-movement" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
+                <i class="fa-solid fa-truck-ramp-box w-5 text-center text-slate-400 group-hover:text-emerald-600"></i> Material Movement
+            </a>
 
             <a href="/inventory/summary" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
-                <i class="fa-solid fa-chart-bar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Inventory Summary
+                <i class="fa-solid fa-chart-bar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Material Flow Dashboard
             </a>
+
+            <button id="nav-inventory" onclick="switchTab('inventory')" class="w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left">
+                <i class="fa-solid fa-boxes-stacked w-5 text-center text-indigo-600"></i> Inventory Configuration
+            </button>
+
             
             <button id="nav-requisitions" onclick="switchTab('requisitions')" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
                 <i class="fa-solid fa-file-invoice-dollar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Requisitions
@@ -147,7 +152,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
             <div class="flex items-center gap-2 text-xs font-semibold text-slate-400">
                 <span class="uppercase tracking-wider text-indigo-600 font-bold">EIPL Framework</span>
                 <i class="fa-solid fa-chevron-right text-[9px] text-slate-300"></i>
-                <span id="header-breadcrumb" class="text-slate-700 font-medium">Inventory Status Dashboard</span>
+                <span id="header-breadcrumb" class="text-slate-700 font-medium">Inventory Configuration Dashboard</span>
             </div>
         </header>
 
@@ -157,85 +162,13 @@ LAYOUT_HTML = """<!DOCTYPE html>
                 
                 <div class="xl:col-span-1 space-y-6">
                     __ADMIN_PANEL__
-                    
-                    <div class="bg-white border border-slate-200 p-6 rounded-2xl shadow-sm space-y-4">
-                        <div class="flex items-center justify-between border-b border-slate-100 pb-3">
-                            <div>
-                                <h3 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Inward Transaction</h3>
-                                <p class="text-[10px] text-slate-400 mt-0.5">Record incoming materials — GRN upload mandatory</p>
-                            </div>
-                            <button type="button" onclick="downloadTransactionCSVTemplate()" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-100 px-2.5 py-1 rounded-lg text-[10px] font-bold transition-all flex items-center gap-1 shadow-sm">
-                                <i class="fa-solid fa-download"></i> Template
-                            </button>
-                        </div>
-                        
-                        <form action="/transaction" method="POST" enctype="multipart/form-data" class="space-y-4 text-xs text-slate-700">
-                            <!-- SEARCH & SELECT ITEM — MIS style -->
-                            <div class="relative">
-                                <label class="block font-semibold text-slate-600 mb-1.5">Search &amp; Select Item</label>
-                                <input type="text" id="txn_item_search" placeholder="Type item name or code..." autocomplete="off"
-                                    class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm"
-                                    oninput="filterTxnItems(this.value)" onfocus="showTxnDropdown()">
-                                <div id="txn_item_dropdown" class="absolute z-30 w-full bg-white border border-slate-200 rounded-xl shadow-xl mt-1 max-h-48 overflow-y-auto hidden"></div>
-                                <input type="hidden" id="txn_item_id" name="item_id" required>
-                                <p id="txn_selected_item_label" class="text-[10px] text-indigo-600 font-semibold mt-1 hidden"></p>
-                            </div>
-                            <div class="grid grid-cols-2 gap-3">
-                                <div>
-                                    <label class="block font-semibold text-slate-600 mb-1.5">Quantity Received</label>
-                                    <input type="number" name="quantity" min="1" value="1" required class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm font-mono font-semibold">
-                                </div>
-                                <div>
-                                    <label class="block font-semibold text-slate-600 mb-1.5">Unit of Measure</label>
-                                    <select name="uom" required class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm">
-                                        <option value="Nos">Nos — Numbers</option>
-                                        <option value="Mtr">Mtr — Metres</option>
-                                        <option value="Kg">Kg — Kilograms</option>
-                                        <option value="Ltr">Ltr — Litres</option>
-                                        <option value="Set">Set</option>
-                                        <option value="Pair">Pair</option>
-                                        <option value="Box">Box</option>
-                                        <option value="Roll">Roll</option>
-                                        <option value="Bag">Bag</option>
-                                        <option value="Ton">Ton</option>
-                                        <option value="Sqm">Sqm — Sq. Metres</option>
-                                        <option value="Rmt">Rmt — Running Metres</option>
-                                        <option value="Lot">Lot</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div>
-                                <label class="block font-semibold text-slate-600 mb-1.5">Received By <span class="text-rose-500 font-black">*</span></label>
-                                <select name="received_by" required class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm">
-                                    <option value="">— Select Employee —</option>
-                                    __EMPLOYEE_OPTIONS__
-                                </select>
-                            </div>
-                            <div>
-                                <label class="block font-semibold text-slate-600 mb-1.5">Upload GRN <span class="text-rose-500 font-black">*</span></label>
-                                <input type="file" name="grn_file" required accept=".pdf,.jpg,.jpeg,.png,.xlsx,.xls,.doc,.docx"
-                                    class="w-full bg-rose-50 border border-rose-200 text-slate-700 text-[11px] p-2 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm">
-                                <p class="text-[10px] text-rose-500 mt-1 font-medium">&#9888; GRN must be uploaded to proceed</p>
-                            </div>
-                            <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white p-2.5 rounded-xl font-bold tracking-wide transition-all shadow-md shadow-emerald-600/10">
-                                &#10003; Record Inward &amp; Upload GRN
-                            </button>
-                        </form>
-                        <div class="pt-4 border-t border-dashed border-slate-200">
-                            <label class="block font-bold text-[10px] uppercase text-emerald-700 mb-2 tracking-wider flex items-center gap-1">📊 Bulk Transactions Upload</label>
-                            <form action="/transaction/bulk-upload" method="POST" enctype="multipart/form-data" class="flex gap-2">
-                                <input type="file" name="file" accept=".csv" required class="w-full bg-slate-50 border border-slate-200 text-slate-600 text-[10px] p-2 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm">
-                                <button type="submit" class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded-xl font-bold text-[10px] tracking-wide transition-all shrink-0 shadow-sm">Upload</button>
-                            </form>
-                        </div>
-                    </div>
                 </div>
 
                 <div class="xl:col-span-2">
                     <div id="inventory-table-container" class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
                         <div class="p-5 border-b border-slate-100 bg-white flex flex-wrap items-center justify-between gap-3">
                             <div>
-                                <h2 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Consolidated Inventory Status</h2>
+                                <h2 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Consolidated Inventory Configuration</h2>
                                 <p class="text-[10px] text-slate-400 mt-0.5">Real-time warehouse material mapping and safety levels</p>
                             </div>
                             <div class="flex flex-wrap items-center gap-2">
@@ -405,16 +338,16 @@ LAYOUT_HTML = """<!DOCTYPE html>
                         <table id="reqTable" class="w-full text-left border-collapse text-xs">
                             <thead>
                                 <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase border-b border-slate-200">
-                                    <th class="p-3 pl-5 whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable('req',0)">Time Stamp <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                    <th class="p-3 cursor-pointer hover:text-indigo-600" onclick="sortTable('req',1)">Item Description <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3 pl-5 whitespace-nowrap text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',0)">Time Stamp <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',1)">Item Description <i class="fa-solid fa-sort text-[9px]"></i></th>
                                     <th class="p-3 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',2)">Qty <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                    <th class="p-3 text-right whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable('req',3)">Est. Value <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                    <th class="p-3">Item Code</th>
-                                    <th class="p-3">Specification</th>
-                                    <th class="p-3 whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable('req',6)">Requested By <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    __EST_VALUE_HEADER__
+                                    <th class="p-3 text-center">Item Code</th>
+                                    <th class="p-3 text-center">Specification</th>
+                                    <th class="p-3 text-center whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable('req',6)">Requested By <i class="fa-solid fa-sort text-[9px]"></i></th>
                                     <th class="p-3 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',7)">Status <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                    <th class="p-3">Communication</th>
-                                    <th class="p-3 text-right pr-5 whitespace-nowrap">Workflow</th>
+                                    <th class="p-3 text-center">Communication</th>
+                                    <th class="p-3 text-center whitespace-nowrap">Workflow</th>
                                 </tr>
                             </thead>
                             <tbody id="reqTableBody" class="divide-y divide-slate-100 font-medium text-slate-700">
@@ -430,78 +363,9 @@ LAYOUT_HTML = """<!DOCTYPE html>
                 </div>
             </div>
 
-            <div id="tab-viewport-allocations" class="hidden grid-cols-1 xl:grid-cols-3 gap-6 items-start">
+            <div id="tab-viewport-allocations" class="hidden grid-cols-1 gap-6 items-start">
                 
-                <div class="xl:col-span-1">
-                    <div class="bg-white border border-slate-200 p-6 rounded-2xl shadow-sm space-y-4">
-                        <div>
-                            <h3 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Material Issue Slip</h3>
-                            <p class="text-[10px] text-slate-400 mt-0.5">Issue procured materials — MIS upload mandatory to proceed</p>
-                        </div>
-                        
-                        <form action="/material/issue" method="POST" enctype="multipart/form-data" class="space-y-4 text-xs text-slate-700 border-t border-slate-100 pt-3">
-                            <!-- ITEM SEARCH BOX -->
-                            <div class="relative">
-                                <label class="block font-semibold text-slate-600 mb-1.5">Search & Select Item</label>
-                                <input type="text" id="mis_item_search" placeholder="Type item name or code..." autocomplete="off"
-                                    class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm"
-                                    oninput="filterMISItems(this.value)" onfocus="showMISDropdown()" />
-                                <div id="mis_item_dropdown" class="absolute z-30 w-full bg-white border border-slate-200 rounded-xl shadow-xl mt-1 max-h-48 overflow-y-auto hidden"></div>
-                                <input type="hidden" id="mis_item_id" name="item_id" required />
-                                <p id="mis_selected_item_label" class="text-[10px] text-indigo-600 font-semibold mt-1 hidden"></p>
-                            </div>
-
-                            <div class="grid grid-cols-2 gap-3">
-                                <div>
-                                    <label class="block font-semibold text-slate-600 mb-1.5">Issue Quantity</label>
-                                    <input type="number" name="quantity" min="1" value="1" required class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm font-mono font-semibold">
-                                </div>
-                                <div>
-                                    <label class="block font-semibold text-slate-600 mb-1.5">Unit (UOM)</label>
-                                    <select name="uom" required class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm">
-                                        <option value="Nos">Nos — Numbers</option>
-                                        <option value="Mtr">Mtr — Metres</option>
-                                        <option value="Kg">Kg — Kilograms</option>
-                                        <option value="Ltr">Ltr — Litres</option>
-                                        <option value="Set">Set</option>
-                                        <option value="Pair">Pair</option>
-                                        <option value="Box">Box</option>
-                                        <option value="Roll">Roll</option>
-                                        <option value="Bag">Bag</option>
-                                        <option value="Ton">Ton</option>
-                                        <option value="Sqm">Sqm — Sq. Metres</option>
-                                        <option value="Rmt">Rmt — Running Metres</option>
-                                        <option value="Lot">Lot</option>
-                                    </select>
-                                </div>
-                            </div>
-                            <div>
-                                <label class="block font-semibold text-slate-600 mb-1.5">Issued To</label>
-                                <select name="issued_to" class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm font-medium">__EMPLOYEE_OPTIONS__</select>
-                            </div>
-                            <div>
-                                <label class="block font-semibold text-slate-600 mb-1.5">Department</label>
-                                <input type="text" name="department" placeholder="e.g. Mechanical, Electrical, Operations" required class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm">
-                            </div>
-                            <input type="hidden" name="issued_by" value="__USER__">
-                            <div>
-                                <label class="block font-semibold text-slate-600 mb-1.5">Field Remarks</label>
-                                <input type="text" name="remarks" placeholder="Purpose or site reference" class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm">
-                            </div>
-                            <div>
-                                <label class="block font-semibold text-slate-600 mb-1.5">Upload MIS <span class="text-rose-500 font-black">*</span></label>
-                                <input type="file" name="mis_file" required accept=".pdf,.jpg,.jpeg,.png,.xlsx,.xls,.doc,.docx"
-                                    class="w-full bg-rose-50 border border-rose-200 text-slate-700 text-[11px] p-2 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm">
-                                <p class="text-[10px] text-rose-500 mt-1 font-medium">&#9888; MIS must be uploaded to proceed with issuance</p>
-                            </div>
-                            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white p-2.5 rounded-xl font-bold tracking-wide transition-all shadow-md shadow-indigo-600/10">
-                                &#10003; Authorize Issue &amp; Upload MIS
-                            </button>
-                        </form>
-                    </div>
-                </div>
-
-                <div class="xl:col-span-2">
+                <div class="xl:col-span-3">
                     <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
                         <div class="p-5 border-b border-slate-100 bg-white">
                             <div class="flex flex-wrap items-center justify-between gap-3">
@@ -612,7 +476,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
             var d = btn.dataset;
 
             if (action === 'procure') {
-                openProcurementModal(d.id, d.name, d.code);
+                openInwardFormForItem(d.id, d.name, d.code, d.price, d.uom, d.vendor);
             } else if (action === 'edit-item') {
                 openEditItemModal(d.id, d.name, d.code, d.price, d.stock, d.minstock);
             } else if (action === 'edit-request') {
@@ -685,50 +549,113 @@ LAYOUT_HTML = """<!DOCTYPE html>
         }
         // ---- END MIS ITEM SEARCH ----
 
-        // ---- TXN ITEM SEARCH ENGINE (Inward Transaction) ----
-        function filterTxnItems(query) {
-            var dropdown = document.getElementById('txn_item_dropdown');
+        // ---- INWARD ITEM SEARCH ENGINE (unified Inward Transaction panel) ----
+        function filterInwardItems(query) {
+            var dropdown = document.getElementById('inward_item_dropdown');
             if (!dropdown) return;
-            if (!query || query.trim() === '') { dropdown.classList.add('hidden'); return; }
+            var newOpt = '<div class="p-2.5 hover:bg-amber-50 cursor-pointer border-b border-amber-100 inward-dropdown-item font-bold text-amber-700 text-xs" data-id="NEW_INWARD_ITEM" data-name="" data-code="" data-uom="" data-price="" data-vendor="">&#10133; NEW ITEM (Add to Catalog)</div>';
+            if (!query || query.trim() === '') {
+                dropdown.innerHTML = newOpt + '<div class="p-3 text-slate-400 text-xs">Type to search existing items...</div>';
+                dropdown.classList.remove('hidden'); return;
+            }
             var q = query.toLowerCase();
             var matches = MIS_INVENTORY_DATA.filter(function(i) {
                 return i.name.toLowerCase().includes(q) || i.code.toLowerCase().includes(q);
             });
-            if (matches.length === 0) {
-                dropdown.innerHTML = '<div class="p-3 text-slate-400 text-xs">No matching items found</div>';
-                dropdown.classList.remove('hidden'); return;
-            }
-            dropdown.innerHTML = matches.slice(0, 10).map(function(i) {
+            var itemsHtml = matches.slice(0, 10).map(function(i) {
                 var stockColor = i.stock > 0 ? 'text-emerald-600' : 'text-rose-600';
                 var safeName = i.name.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
                 var safeCode = i.code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-                return '<div class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 last:border-0 txn-dropdown-item" data-id="' + i.id + '" data-name="' + safeName + '" data-code="' + safeCode + '" data-stock="' + i.stock + '">' +
-                    '<div class="font-semibold text-slate-800 text-xs pointer-events-none">' + safeName + '</div>' +
+                var uomBadge = i.uom ? ' <span class="text-[9px] font-bold text-indigo-500 bg-indigo-50 px-1 rounded">🔒' + i.uom + '</span>' : '';
+                return '<div class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 last:border-0 inward-dropdown-item" data-id="' + i.id + '" data-name="' + safeName + '" data-code="' + safeCode + '" data-uom="' + (i.uom||'') + '" data-price="' + (i.price||0) + '" data-vendor="' + (i.vendor||'').replace(/"/g,'&quot;') + '">' +
+                    '<div class="font-semibold text-slate-800 text-xs pointer-events-none">' + safeName + uomBadge + '</div>' +
                     '<div class="flex gap-2 mt-0.5 pointer-events-none"><span class="font-mono text-[10px] text-slate-400">' + safeCode + '</span><span class="text-[10px] font-bold ' + stockColor + '">Stock: ' + i.stock + '</span></div>' +
                     '</div>';
             }).join('');
+            dropdown.innerHTML = newOpt + (itemsHtml || '<div class="p-3 text-slate-400 text-xs">No matching items found</div>');
             dropdown.classList.remove('hidden');
         }
-        function showTxnDropdown() {
-            var val = document.getElementById('txn_item_search').value;
-            if (val && val.trim().length > 0) filterTxnItems(val);
-        }
-        function selectTxnItem(id, name, code, stock) {
-            document.getElementById('txn_item_id').value = id;
-            document.getElementById('txn_item_search').value = name + ' (' + code + ')';
-            document.getElementById('txn_item_dropdown').classList.add('hidden');
-            var label = document.getElementById('txn_selected_item_label');
-            label.textContent = 'Selected: ' + name + ' | Stock: ' + stock;
-            label.classList.remove('hidden');
+        function showInwardDropdown() { filterInwardItems(document.getElementById('inward_item_search').value || ''); }
+        function selectInwardItem(id, name, code, uom, price, vendor) {
+            var isNew = (id === 'NEW_INWARD_ITEM');
+            document.getElementById('inward_item_id').value = id;
+            document.getElementById('inward_item_search').value = isNew ? '' : name + ' (' + code + ')';
+            document.getElementById('inward_item_dropdown').classList.add('hidden');
+            var label = document.getElementById('inward_selected_label');
+            var newFields = document.getElementById('inward_new_item_fields');
+            var uomSelect = document.getElementById('inward_uom_select');
+            var uomDisplay = document.getElementById('inward_uom_display');
+            if (isNew) {
+                label.textContent = '+ New item — fill item details below';
+                label.className = 'text-[10px] text-amber-600 font-semibold mt-1';
+                if (newFields) newFields.style.display = 'block';
+                if (uomSelect) uomSelect.style.display = '';
+                if (uomDisplay) uomDisplay.style.display = 'none';
+                var nameIn = document.getElementById('inward_new_name');
+                var codeIn = document.getElementById('inward_new_code');
+                if (nameIn) { nameIn.required = true; }
+                if (codeIn) { codeIn.required = true; }
+            } else {
+                label.textContent = 'Selected: ' + name + ' (' + code + ')';
+                label.className = 'text-[10px] text-indigo-600 font-semibold mt-1';
+                if (newFields) newFields.style.display = 'none';
+                var nameIn = document.getElementById('inward_new_name');
+                var codeIn = document.getElementById('inward_new_code');
+                if (nameIn) { nameIn.required = false; nameIn.value = ''; }
+                if (codeIn) { codeIn.required = false; codeIn.value = ''; }
+                // Handle UOM lock
+                if (uom) {
+                    if (uomSelect) uomSelect.style.display = 'none';
+                    if (uomDisplay) uomDisplay.style.display = 'block';
+                    var lockedVal = document.getElementById('inward_uom_locked_val');
+                    var lockedText = document.getElementById('inward_uom_locked_text');
+                    if (lockedVal) lockedVal.value = uom;
+                    if (lockedText) lockedText.textContent = uom;
+                    if (uomSelect) uomSelect.removeAttribute('required');
+                } else {
+                    if (uomSelect) { uomSelect.style.display = ''; uomSelect.required = true; }
+                    if (uomDisplay) uomDisplay.style.display = 'none';
+                }
+                // Pre-fill vendor and price (editable)
+                var vendorIn = document.getElementById('inward_vendor');
+                var priceIn = document.getElementById('inward_price');
+                if (vendorIn && vendor) vendorIn.value = vendor;
+                if (priceIn && price) priceIn.value = parseFloat(price).toFixed(2);
+            }
         }
         document.addEventListener('click', function(e) {
-            var item = e.target.closest('.txn-dropdown-item');
-            if (item) { selectTxnItem(item.dataset.id, item.dataset.name, item.dataset.code, item.dataset.stock); return; }
-            var dd = document.getElementById('txn_item_dropdown');
-            var sr = document.getElementById('txn_item_search');
+            var item = e.target.closest('.inward-dropdown-item');
+            if (item) { selectInwardItem(item.dataset.id, item.dataset.name, item.dataset.code, item.dataset.uom, item.dataset.price, item.dataset.vendor); return; }
+            var dd = document.getElementById('inward_item_dropdown');
+            var sr = document.getElementById('inward_item_search');
             if (dd && sr && !dd.contains(e.target) && e.target !== sr) dd.classList.add('hidden');
         });
-        // ---- END TXN ITEM SEARCH ----
+        // Initialize inward form: default to NEW mode
+        window.addEventListener('DOMContentLoaded', function() {
+            var newFields = document.getElementById('inward_new_item_fields');
+            if (newFields) newFields.style.display = 'block';
+        });
+
+        // Called when "⬇ Inward" button is clicked on any row
+        function openInwardFormForItem(id, name, code, price, uom, vendor) {
+            // Switch to inventory tab (it's already there in tab-viewport-inventory)
+            // Pre-fill the inward form with this item
+            var searchEl = document.getElementById('inward_item_search');
+            if (searchEl) {
+                searchEl.value = name + ' (' + code + ')';
+            }
+            selectInwardItem(id, name, code, uom, price, vendor);
+            // Scroll inward form into view
+            var form = document.getElementById('inwardForm');
+            if (form) {
+                form.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                // Brief highlight
+                form.style.transition = 'box-shadow 0.3s';
+                form.style.boxShadow = '0 0 0 3px #059669';
+                setTimeout(function() { form.style.boxShadow = ''; }, 1500);
+            }
+        }
+        // ---- END INWARD ITEM SEARCH ----
 
         // ---- PROC ITEM SEARCH ENGINE (Procurement Indent) ----
         function filterProcItems(query) {
@@ -942,7 +869,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
 
             if (tabId === 'inventory') {
                 document.getElementById('tab-viewport-inventory').style.display = 'grid';
-                breadcrumb.innerText = "Inventory Status Dashboard";
+                breadcrumb.innerText = "Inventory Configuration Dashboard";
                 activeNav.className = "w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left";
                 activeNav.querySelector('i').className = "fa-solid fa-boxes-stacked w-5 text-center text-indigo-600";
                 tagRows('invTableBody'); renderTable('inv');
@@ -972,6 +899,13 @@ LAYOUT_HTML = """<!DOCTYPE html>
                 switchTab('requisitions');
             } else {
                 switchTab('inventory');
+            }
+
+            var openParam = urlParams.get('open');
+            if (openParam === 'employee') {
+                openEmployeeModal();
+            } else if (openParam === 'access') {
+                openAccessModal();
             }
         });
 

@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EIPL App — Render + Supabase Deployment Guide</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #f1f5f9; color: #1e293b; line-height: 1.7; }
+  .container { max-width: 860px; margin: 0 auto; padding: 40px 24px 80px; }
+  h1 { font-size: 1.7rem; font-weight: 800; color: #0f172a; margin-bottom: 6px; }
+  .subtitle { color: #64748b; font-size: 0.95rem; margin-bottom: 36px; }
+  .phase { background: white; border-radius: 14px; border: 1px solid #e2e8f0; margin-bottom: 28px; overflow: hidden; box-shadow: 0 1px 6px rgba(0,0,0,0.06); }
+  .phase-header { padding: 18px 24px; display: flex; align-items: center; gap: 14px; border-bottom: 1px solid #f1f5f9; }
+  .phase-num { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1rem; flex-shrink: 0; }
+  .p1 .phase-num { background: #dbeafe; color: #1d4ed8; }
+  .p2 .phase-num { background: #dcfce7; color: #15803d; }
+  .p3 .phase-num { background: #fef9c3; color: #a16207; }
+  .p4 .phase-num { background: #fae8ff; color: #7e22ce; }
+  .p5 .phase-num { background: #fee2e2; color: #b91c1c; }
+  .p6 .phase-num { background: #e0f2fe; color: #0369a1; }
+  .phase-title { font-size: 1.05rem; font-weight: 700; color: #0f172a; }
+  .phase-sub { font-size: 0.8rem; color: #94a3b8; }
+  .phase-body { padding: 20px 24px; }
+  .step { display: flex; gap: 14px; margin-bottom: 18px; }
+  .step:last-child { margin-bottom: 0; }
+  .step-icon { font-size: 1.2rem; margin-top: 1px; flex-shrink: 0; }
+  .step-content h4 { font-size: 0.9rem; font-weight: 700; color: #1e293b; margin-bottom: 4px; }
+  .step-content p { font-size: 0.85rem; color: #475569; margin-bottom: 6px; }
+  code { background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 5px; padding: 2px 7px; font-family: 'Courier New', monospace; font-size: 0.82rem; color: #7c3aed; }
+  .code-block { background: #0f172a; color: #e2e8f0; border-radius: 10px; padding: 14px 18px; margin: 8px 0; font-family: 'Courier New', monospace; font-size: 0.82rem; line-height: 1.8; overflow-x: auto; }
+  .code-block .comment { color: #64748b; }
+  .code-block .key { color: #7dd3fc; }
+  .code-block .val { color: #86efac; }
+  .warning { background: #fffbeb; border: 1px solid #fde68a; border-radius: 10px; padding: 12px 16px; font-size: 0.83rem; color: #92400e; margin: 10px 0; }
+  .warning strong { color: #78350f; }
+  .tip { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; padding: 12px 16px; font-size: 0.83rem; color: #14532d; margin: 10px 0; }
+  .badge { display: inline-block; background: #dbeafe; color: #1d4ed8; font-size: 0.72rem; font-weight: 700; padding: 2px 8px; border-radius: 20px; margin-left: 6px; }
+  .badge.green { background: #dcfce7; color: #15803d; }
+  .badge.red { background: #fee2e2; color: #b91c1c; }
+  .badge.purple { background: #fae8ff; color: #7e22ce; }
+  .file-list { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 14px; margin: 8px 0; }
+  .file-list li { font-size: 0.83rem; color: #475569; padding: 3px 0; font-family: monospace; list-style: none; }
+  .file-list li::before { content: "📄 "; }
+  .file-list li.folder::before { content: "📁 "; }
+  .file-list li.important::before { content: "⭐ "; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.83rem; margin: 10px 0; }
+  th { background: #f1f5f9; font-weight: 700; text-align: left; padding: 8px 12px; border: 1px solid #e2e8f0; }
+  td { padding: 8px 12px; border: 1px solid #e2e8f0; color: #475569; }
+  .divider { border: none; border-top: 1px dashed #e2e8f0; margin: 16px 0; }
+  .final-box { background: linear-gradient(135deg, #1e3a5f, #1d4ed8); color: white; border-radius: 14px; padding: 28px; text-align: center; margin-top: 36px; }
+  .final-box h2 { font-size: 1.3rem; margin-bottom: 8px; }
+  .final-box p { font-size: 0.88rem; opacity: 0.85; }
+  .url-box { background: rgba(255,255,255,0.15); border-radius: 8px; padding: 10px 20px; margin-top: 14px; font-family: monospace; font-size: 1rem; letter-spacing: 0.5px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <h1>🚀 EIPL App — Live Deployment Guide</h1>
+  <p class="subtitle">Render (Hosting) + Supabase (PostgreSQL Database) — Free Tier • Step-by-Step</p>
+
+  <!-- PHASE 1 -->
+  <div class="phase p1">
+    <div class="phase-header">
+      <div class="phase-num">1</div>
+      <div>
+        <div class="phase-title">Prepare Your Project Folder</div>
+        <div class="phase-sub">Organise files correctly before uploading to GitHub</div>
+      </div>
+    </div>
+    <div class="phase-body">
+      <div class="step">
+        <div class="step-icon">📁</div>
+        <div class="step-content">
+          <h4>Your project folder should look like this:</h4>
+          <ul class="file-list">
+            <li class="important">app.py</li>
+            <li class="important">database.py</li>
+            <li class="important">models.py</li>
+            <li>templates.py</li>
+            <li>migrate.py</li>
+            <li class="important">requirements.txt <span style="color:#15803d;font-style:italic;">(use the cleaned version provided)</span></li>
+            <li class="important">render.yaml <span style="color:#15803d;font-style:italic;">(new file provided)</span></li>
+            <li class="important">.gitignore <span style="color:#15803d;font-style:italic;">(new file provided)</span></li>
+            <li class="folder">static/ <span style="color:#94a3b8;font-style:italic;">(your logo/assets folder)</span></li>
+          </ul>
+          <div class="warning">
+            <strong>⚠️ Do NOT include:</strong> <code>inventory.db</code>, <code>backup_inventory_live.db</code>, or any <code>.db</code> files. The .gitignore will block these automatically.
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">✏️</div>
+        <div class="step-content">
+          <h4>Replace your requirements.txt with the cleaned version</h4>
+          <p>The original had duplicate entries. Use the provided clean <code>requirements.txt</code>:</p>
+          <div class="code-block">fastapi
+uvicorn[standard]
+sqlalchemy
+python-multipart
+psycopg2-binary</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHASE 2 -->
+  <div class="phase p2">
+    <div class="phase-header">
+      <div class="phase-num">2</div>
+      <div>
+        <div class="phase-title">Push Code to GitHub</div>
+        <div class="phase-sub">Render deploys directly from a GitHub repository</div>
+      </div>
+    </div>
+    <div class="phase-body">
+      <div class="step">
+        <div class="step-icon">1️⃣</div>
+        <div class="step-content">
+          <h4>Create a GitHub account (if you don't have one)</h4>
+          <p>Go to <strong>github.com</strong> → Sign Up (free). Verify your email.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">2️⃣</div>
+        <div class="step-content">
+          <h4>Create a new repository</h4>
+          <p>Click <strong>+ New</strong> → Name it <code>eipl-inventory</code> → Select <strong>Private</strong> → Click <strong>Create repository</strong>.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">3️⃣</div>
+        <div class="step-content">
+          <h4>Upload your files</h4>
+          <p>On the new repo page, click <strong>"uploading an existing file"</strong> → Drag and drop all your project files → Click <strong>Commit changes</strong>.</p>
+          <div class="tip">✅ No Git installation needed — GitHub's web interface works fine for this.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHASE 3 -->
+  <div class="phase p3">
+    <div class="phase-header">
+      <div class="phase-num">3</div>
+      <div>
+        <div class="phase-title">Set Up Supabase PostgreSQL Database</div>
+        <div class="phase-sub">Free managed PostgreSQL — replaces your local inventory.db</div>
+      </div>
+    </div>
+    <div class="phase-body">
+      <div class="step">
+        <div class="step-icon">1️⃣</div>
+        <div class="step-content">
+          <h4>Create a Supabase account</h4>
+          <p>Go to <strong>supabase.com</strong> → Sign Up with GitHub (easiest) → Free tier is enough.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">2️⃣</div>
+        <div class="step-content">
+          <h4>Create a new project</h4>
+          <p>Click <strong>New Project</strong> → Enter a name like <code>eipl-inventory</code> → Set a strong database password (save this!) → Choose region: <strong>Southeast Asia (Singapore)</strong> for best speed from India → Click <strong>Create Project</strong>.</p>
+          <div class="warning"><strong>⚠️ Save your database password</strong> — you cannot recover it later. Write it down now.</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">3️⃣</div>
+        <div class="step-content">
+          <h4>Get your connection string</h4>
+          <p>In your Supabase project → Go to <strong>Settings</strong> (⚙️ in left sidebar) → <strong>Database</strong> → Scroll to <strong>"Connection string"</strong> → Select <strong>URI</strong> tab → Copy the string.</p>
+          <p>It will look like:</p>
+          <div class="code-block"><span class="val">postgresql://postgres:[YOUR-PASSWORD]@db.xxxxxxxxxxxx.supabase.co:5432/postgres</span></div>
+          <p>Replace <code>[YOUR-PASSWORD]</code> with the password you set above. Keep this string safe — it is your database key.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHASE 4 -->
+  <div class="phase p4">
+    <div class="phase-header">
+      <div class="phase-num">4</div>
+      <div>
+        <div class="phase-title">Deploy on Render</div>
+        <div class="phase-sub">Connect GitHub repo → set DATABASE_URL → deploy</div>
+      </div>
+    </div>
+    <div class="phase-body">
+      <div class="step">
+        <div class="step-icon">1️⃣</div>
+        <div class="step-content">
+          <h4>Create a Render account</h4>
+          <p>Go to <strong>render.com</strong> → Sign Up with GitHub → This links your GitHub repos automatically.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">2️⃣</div>
+        <div class="step-content">
+          <h4>Create a new Web Service</h4>
+          <p>Click <strong>New +</strong> → <strong>Web Service</strong> → Connect your <code>eipl-inventory</code> GitHub repo → Click <strong>Connect</strong>.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">3️⃣</div>
+        <div class="step-content">
+          <h4>Configure the service settings</h4>
+          <table>
+            <tr><th>Field</th><th>Value to Enter</th></tr>
+            <tr><td>Name</td><td><code>eipl-inventory</code></td></tr>
+            <tr><td>Region</td><td>Singapore (closest to India)</td></tr>
+            <tr><td>Branch</td><td>main</td></tr>
+            <tr><td>Runtime</td><td>Python 3</td></tr>
+            <tr><td>Build Command</td><td><code>pip install -r requirements.txt</code></td></tr>
+            <tr><td>Start Command</td><td><code>uvicorn app:app --host 0.0.0.0 --port $PORT</code></td></tr>
+            <tr><td>Plan</td><td>Free</td></tr>
+          </table>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">4️⃣</div>
+        <div class="step-content">
+          <h4>Add your DATABASE_URL environment variable</h4>
+          <p>Scroll down to <strong>Environment Variables</strong> section → Click <strong>Add Environment Variable</strong>:</p>
+          <table>
+            <tr><th>Key</th><th>Value</th></tr>
+            <tr><td><code>DATABASE_URL</code></td><td>Paste your full Supabase PostgreSQL connection string here</td></tr>
+          </table>
+          <div class="warning"><strong>⚠️ Critical:</strong> Your <code>database.py</code> already reads this variable. Do NOT hardcode the database URL in any file.</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">5️⃣</div>
+        <div class="step-content">
+          <h4>Click "Create Web Service"</h4>
+          <p>Render will now install packages and start your app. The first deploy takes about <strong>2–4 minutes</strong>. Watch the live log for any errors.</p>
+          <div class="tip">✅ Your app automatically runs <code>models.Base.metadata.create_all()</code> on startup — this creates all tables in Supabase automatically. No manual SQL needed!</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHASE 5 -->
+  <div class="phase p5">
+    <div class="phase-header">
+      <div class="phase-num">5</div>
+      <div>
+        <div class="phase-title">Verify & First Login</div>
+        <div class="phase-sub">Check your live app is working correctly</div>
+      </div>
+    </div>
+    <div class="phase-body">
+      <div class="step">
+        <div class="step-icon">🌐</div>
+        <div class="step-content">
+          <h4>Open your live URL</h4>
+          <p>Render gives you a URL like: <code>https://eipl-inventory.onrender.com</code></p>
+          <p>Open it in any browser on any device.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">🔑</div>
+        <div class="step-content">
+          <h4>Login with default credentials</h4>
+          <table>
+            <tr><th>Username</th><th>Password</th><th>Role</th></tr>
+            <tr><td><code>admin</code></td><td><code>password123</code></td><td>Admin</td></tr>
+            <tr><td><code>staff</code></td><td><code>password123</code></td><td>Staff</td></tr>
+          </table>
+          <div class="warning"><strong>⚠️ Change these passwords immediately</strong> after your first login — they are seeded by default for any fresh deployment.</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">✅</div>
+        <div class="step-content">
+          <h4>Test core functions</h4>
+          <p>Try adding an item, creating a procurement request, and assigning material. If these work, your deployment is successful!</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHASE 6 -->
+  <div class="phase p6">
+    <div class="phase-header">
+      <div class="phase-num">6</div>
+      <div>
+        <div class="phase-title">Important Limits & Tips (Free Tier)</div>
+        <div class="phase-sub">Know what to expect on the free plan</div>
+      </div>
+    </div>
+    <div class="phase-body">
+      <div class="step">
+        <div class="step-icon">😴</div>
+        <div class="step-content">
+          <h4>App "sleeps" after 15 minutes of inactivity</h4>
+          <p>On the free Render plan, if no one visits the app for 15 minutes, it spins down. The next visitor will wait <strong>~30–60 seconds</strong> for it to wake up. This is normal.</p>
+          <div class="tip">💡 To avoid this, you can use a free service like <strong>UptimeRobot</strong> (uptimerobot.com) to ping your URL every 10 minutes and keep it awake.</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">🗄️</div>
+        <div class="step-content">
+          <h4>Supabase free tier limits</h4>
+          <table>
+            <tr><th>Resource</th><th>Free Limit</th></tr>
+            <tr><td>Database storage</td><td>500 MB</td></tr>
+            <tr><td>Monthly active users</td><td>50,000</td></tr>
+            <tr><td>Project pause</td><td>Pauses after 1 week of inactivity</td></tr>
+          </table>
+          <div class="warning"><strong>⚠️ Supabase pauses your free project</strong> if there's no activity for 7 days. Log into Supabase and click <strong>Restore</strong> if your app can't connect.</div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">🔄</div>
+        <div class="step-content">
+          <h4>How to update your app in future</h4>
+          <p>Edit your code locally → Go to GitHub → Upload the changed files (or drag & drop to replace). Render auto-detects the change and re-deploys within 2 minutes.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-icon">🔒</div>
+        <div class="step-content">
+          <h4>Security note</h4>
+          <p>Your app uses SHA-256 password hashing which is good. Consider adding a <code>SECRET_KEY</code> environment variable for session security in future upgrades.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="final-box">
+    <h2>🎉 Your App Will Be Live At:</h2>
+    <div class="url-box">https://eipl-inventory.onrender.com</div>
+    <p style="margin-top:14px;">Works on any device, any browser, even when your PC is off.<br>Your data lives in Supabase cloud — permanent and safe.</p>
+  </div>
+
+</div>
+</body>
+</html>

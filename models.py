@@ -28,6 +28,7 @@ class Item(Base):
     price = Column(Float, default=0.0)
     current_stock = Column(Integer, default=0)
     minimum_stock = Column(Integer, default=0)
+    uom = Column(String, nullable=True)  # Fixed once set — cannot be changed after first transaction
 
 
 class Employee(Base):

@@ -2,7 +2,4 @@ fastapi
 uvicorn[standard]
 sqlalchemy
 python-multipart
-fastapi
-uvicorn[standard]
-sqlalchemy
 psycopg2-binary
