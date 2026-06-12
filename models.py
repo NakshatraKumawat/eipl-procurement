@@ -135,6 +135,7 @@ class GRNRecord(Base):
     item_id = Column(Integer, ForeignKey("items.id"))
     quantity = Column(Integer)
     uom = Column(String, default="Nos")
+    received_by = Column(String, nullable=True)
     grn_filename = Column(String)
     uploaded_by_id = Column(Integer, ForeignKey("users.id"))
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)

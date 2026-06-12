@@ -74,16 +74,15 @@ LAYOUT_HTML = """<!DOCTYPE html>
 <body class="bg-slate-50 text-slate-800 min-h-screen flex">
 
     <aside class="w-64 bg-white border-r border-slate-200 flex flex-col shrink-0 shadow-sm z-20">
-        <div class="p-6 border-b border-slate-100">
-            <div class="flex items-center gap-3">
-                <div class="bg-indigo-600 px-3 py-2 rounded-xl text-white shadow-md shadow-indigo-600/20 font-black tracking-tighter text-sm">
-                    EIPL
-                </div>
-                <div class="min-w-0">
-                    <h2 class="font-bold text-slate-900 tracking-tight text-sm leading-tight uppercase truncate">Electra Infracon</h2>
-                    <p class="text-[10px] text-slate-400 font-mono mt-0.5 truncate">UID: __USER__</p>
-                </div>
+        <div class="p-5 border-b border-slate-100 text-center">
+            <img src="/static/logo.png" alt="EIPL Logo"
+                class="h-20 mx-auto mb-2 object-contain"
+                onerror="this.style.display='none';document.getElementById('logoFallback').style.display='inline-block';">
+            <div id="logoFallback" style="display:none;" class="bg-indigo-600 px-3 py-2 rounded-xl text-white shadow-md shadow-indigo-600/20 font-black tracking-tighter text-sm mb-2">
+                EIPL
             </div>
+            <h2 class="font-black text-slate-900 tracking-tight text-[13px] leading-tight uppercase">Electra Infracon Pvt Ltd</h2>
+            <p class="text-[10px] text-slate-400 font-mono mt-1">UID: __USER__</p>
         </div>
 
         <nav class="flex-1 p-4 space-y-1 overflow-y-auto">
@@ -92,6 +91,10 @@ LAYOUT_HTML = """<!DOCTYPE html>
             <button id="nav-inventory" onclick="switchTab('inventory')" class="w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left">
                 <i class="fa-solid fa-boxes-stacked w-5 text-center text-indigo-600"></i> Inventory Status
             </button>
+
+            <a href="/inventory/summary" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
+                <i class="fa-solid fa-chart-bar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Inventory Summary
+            </a>
             
             <button id="nav-requisitions" onclick="switchTab('requisitions')" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
                 <i class="fa-solid fa-file-invoice-dollar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Requisitions
@@ -167,9 +170,15 @@ LAYOUT_HTML = """<!DOCTYPE html>
                         </div>
                         
                         <form action="/transaction" method="POST" enctype="multipart/form-data" class="space-y-4 text-xs text-slate-700">
-                            <div>
-                                <label class="block font-semibold text-slate-600 mb-1.5">Select Item</label>
-                                <select name="item_id" class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm">__OPTIONS__</select>
+                            <!-- SEARCH & SELECT ITEM — MIS style -->
+                            <div class="relative">
+                                <label class="block font-semibold text-slate-600 mb-1.5">Search &amp; Select Item</label>
+                                <input type="text" id="txn_item_search" placeholder="Type item name or code..." autocomplete="off"
+                                    class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm"
+                                    oninput="filterTxnItems(this.value)" onfocus="showTxnDropdown()">
+                                <div id="txn_item_dropdown" class="absolute z-30 w-full bg-white border border-slate-200 rounded-xl shadow-xl mt-1 max-h-48 overflow-y-auto hidden"></div>
+                                <input type="hidden" id="txn_item_id" name="item_id" required>
+                                <p id="txn_selected_item_label" class="text-[10px] text-indigo-600 font-semibold mt-1 hidden"></p>
                             </div>
                             <div class="grid grid-cols-2 gap-3">
                                 <div>
@@ -196,13 +205,20 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                 </div>
                             </div>
                             <div>
+                                <label class="block font-semibold text-slate-600 mb-1.5">Received By <span class="text-rose-500 font-black">*</span></label>
+                                <select name="received_by" required class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm">
+                                    <option value="">— Select Employee —</option>
+                                    __EMPLOYEE_OPTIONS__
+                                </select>
+                            </div>
+                            <div>
                                 <label class="block font-semibold text-slate-600 mb-1.5">Upload GRN <span class="text-rose-500 font-black">*</span></label>
                                 <input type="file" name="grn_file" required accept=".pdf,.jpg,.jpeg,.png,.xlsx,.xls,.doc,.docx"
                                     class="w-full bg-rose-50 border border-rose-200 text-slate-700 text-[11px] p-2 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm">
-                                <p class="text-[10px] text-rose-500 mt-1 font-medium">⚠ GRN must be uploaded to proceed</p>
+                                <p class="text-[10px] text-rose-500 mt-1 font-medium">&#9888; GRN must be uploaded to proceed</p>
                             </div>
                             <button type="submit" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white p-2.5 rounded-xl font-bold tracking-wide transition-all shadow-md shadow-emerald-600/10">
-                                ✓ Record Inward & Upload GRN
+                                &#10003; Record Inward &amp; Upload GRN
                             </button>
                         </form>
                         <div class="pt-4 border-t border-dashed border-slate-200">
@@ -217,32 +233,48 @@ LAYOUT_HTML = """<!DOCTYPE html>
 
                 <div class="xl:col-span-2">
                     <div id="inventory-table-container" class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-                        <div class="p-5 border-b border-slate-100 bg-white flex items-center justify-between gap-4">
+                        <div class="p-5 border-b border-slate-100 bg-white flex flex-wrap items-center justify-between gap-3">
                             <div>
                                 <h2 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Consolidated Inventory Status</h2>
                                 <p class="text-[10px] text-slate-400 mt-0.5">Real-time warehouse material mapping and safety levels</p>
                             </div>
-                            <button onclick="downloadInventoryExcel()" class="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm">
-                                <i class="fa-solid fa-file-excel"></i> Export Matrix
-                            </button>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <div class="relative">
+                                    <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
+                                    <input type="text" id="invSearch" placeholder="Search inventory..." oninput="filterTable('inv')"
+                                        class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-40">
+                                </div>
+                                <select id="invPageSize" onchange="changePageSize('inv')" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl focus:outline-none focus:border-indigo-400">
+                                    <option value="15">15 / page</option>
+                                    <option value="50">50 / page</option>
+                                    <option value="100">100 / page</option>
+                                </select>
+                                <button onclick="downloadInventoryExcel()" class="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm">
+                                    <i class="fa-solid fa-file-excel"></i> Export
+                                </button>
+                            </div>
                         </div>
                         <div class="overflow-x-auto">
                             <table id="inventoryTable" class="w-full text-left border-collapse text-xs">
                                 <thead>
                                     <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase border-b border-slate-200">
-                                        <th class="p-4 pl-5">Item Name</th>
-                                        <th class="p-4">Item Code</th>
-                                        <th class="p-4 admin-only-col">Vendor</th>
-                                        <th class="p-4 admin-only-col">Price</th>
-                                        <th class="p-4 text-center">Current Stock</th>
-                                        <th class="p-4 text-center">Safety Stock</th>
+                                        <th class="p-4 pl-5 cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',0)">Item Name <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',1)">Item Code <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 admin-only-col cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',2)">Vendor <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 admin-only-col cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',3)">Price <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',4)">Current Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',5)">Safety Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 text-right pr-5">Actions</th>
                                     </tr>
                                 </thead>
-                                <tbody class="divide-y divide-slate-100 font-medium text-slate-700">
+                                <tbody id="invTableBody" class="divide-y divide-slate-100 font-medium text-slate-700">
                                     __INVENTORY_ROWS__
                                 </tbody>
                             </table>
+                        </div>
+                        <div id="invPaginationBar" class="flex items-center justify-between px-5 py-3 border-t border-slate-100 bg-slate-50/50 text-xs text-slate-500">
+                            <span id="invPageInfo"></span>
+                            <div class="flex items-center gap-1" id="invPageButtons"></div>
                         </div>
                         <script>
                         (function(){
@@ -256,39 +288,144 @@ LAYOUT_HTML = """<!DOCTYPE html>
                 </div>
             </div>
 
-            <div id="tab-viewport-requisitions" class="hidden grid-cols-1 xl:grid-cols-3 gap-6 items-start">
-                
-                <div class="xl:col-span-1">
-                    __PROCUREMENT_WIDGET_PANEL__
+            <div id="tab-viewport-requisitions" class="hidden flex-col gap-6">
+
+                <!-- CREATE PROCUREMENT INDENT: Landscape full-width card -->
+                <div class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5">
+                    <div class="flex items-center justify-between border-b border-slate-100 pb-3 mb-4">
+                        <div>
+                            <h3 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Create Procurement Indent</h3>
+                            <p class="text-[10px] text-slate-400 mt-0.5">Raise structural material indents — fill all fields and authorize</p>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <a href="/procurement/bulk-template" class="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-2.5 py-1.5 rounded-lg text-[10px] font-bold transition-all flex items-center gap-1 shadow-sm whitespace-nowrap">
+                                <i class="fa-solid fa-download"></i> Template
+                            </a>
+                        </div>
+                    </div>
+
+                    <!-- Main form: landscape grid layout -->
+                    <form action="/procurement/request" method="POST" class="text-xs text-slate-700">
+                        <!-- Search & Select Item — MIS style, full width above grid -->
+                        <div class="relative mb-3">
+                            <label class="block font-semibold text-slate-600 mb-1.5">Search &amp; Select Stock Item</label>
+                            <input type="text" id="proc_item_search" placeholder="Type item name or code — or select NEW below..." autocomplete="off"
+                                class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm"
+                                oninput="filterProcItems(this.value)" onfocus="showProcDropdown()">
+                            <div id="proc_item_dropdown" class="absolute z-30 w-full bg-white border border-slate-200 rounded-xl shadow-xl mt-1 max-h-48 overflow-y-auto hidden"></div>
+                            <input type="hidden" id="proc_item_id" name="item_id" value="NEW_PROCUREMENT_AD_HOC">
+                            <p id="proc_selected_item_label" class="text-[10px] text-indigo-600 font-semibold mt-1"></p>
+                        </div>
+                        <div class="grid grid-cols-3 gap-3 mb-3">
+                            <div>
+                                <label class="block font-semibold text-slate-600 mb-1.5">Quantity Required</label>
+                                <input type="number" name="quantity" min="1" value="1" required class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm font-mono font-semibold">
+                            </div>
+                            <div>
+                                <label class="block font-semibold text-slate-600 mb-1.5">Unit of Measure (UOM)</label>
+                                <select name="uom" class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm">
+                                    <option value="Nos">Nos — Numbers</option>
+                                    <option value="Mtr">Mtr — Metres</option>
+                                    <option value="Kg">Kg — Kilograms</option>
+                                    <option value="Ltr">Ltr — Litres</option>
+                                    <option value="Set">Set</option>
+                                    <option value="Pair">Pair</option>
+                                    <option value="Box">Box</option>
+                                    <option value="Roll">Roll</option>
+                                    <option value="Bag">Bag</option>
+                                    <option value="Ton">Ton</option>
+                                    <option value="Sqm">Sqm — Sq. Metres</option>
+                                    <option value="Rmt">Rmt — Running Metres</option>
+                                    <option value="Lot">Lot</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block font-semibold text-slate-600 mb-1.5">Department / Cost Center</label>
+                                <input type="text" name="department" placeholder="e.g. Udaipur Project" required class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white shadow-sm">
+                            </div>
+                        </div>
+
+                        <!-- Ad-hoc fields: shown only when NEW is selected -->
+                        <div id="adhoc_procurement_fields_group" class="grid grid-cols-2 gap-3 mb-3 bg-amber-50/40 p-3 border border-amber-200/50 rounded-xl">
+                            <div>
+                                <label class="block font-bold text-amber-800 mb-1">New Item Name <span class="text-rose-500">*</span></label>
+                                <input type="text" id="new_item_name_input" name="new_item_name" placeholder="Enter custom item name" class="w-full bg-white border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm">
+                            </div>
+                            <div>
+                                <label class="block font-bold text-amber-800 mb-1">Detailed Specification <span class="text-rose-500">*</span></label>
+                                <textarea id="detailed_specification_input" name="detailed_specification" rows="1" placeholder="Technical specs, grade, dimensions, brand limits..." class="w-full bg-white border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm resize-none"></textarea>
+                            </div>
+                        </div>
+
+                        <div class="flex items-center gap-3">
+                            <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-6 p-2.5 rounded-xl font-bold tracking-wide transition-all shadow-md shadow-indigo-600/10 text-xs">
+                                Authorize Indent Workflow
+                            </button>
+                            <span class="text-[10px] text-slate-400">or use Bulk Import →</span>
+                            <form action="/procurement/bulk-import" method="POST" enctype="multipart/form-data" class="flex gap-2 flex-1">
+                                <input type="file" name="file" accept=".csv" required class="flex-1 bg-slate-50 border border-slate-200 text-slate-600 text-[10px] p-2 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm">
+                                <button type="submit" class="bg-slate-700 hover:bg-slate-800 text-white px-3 py-2 rounded-xl font-bold text-[10px] tracking-wide transition-all shrink-0 shadow-sm">Import CSV</button>
+                            </form>
+                        </div>
+                    </form>
                 </div>
 
-                <div class="xl:col-span-2">
-                    <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-                        <div class="p-5 border-b border-slate-100 bg-white">
-                            <h2 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Procurement Pipeline Indents</h2>
-                            <p class="text-[10px] text-slate-400 mt-0.5">Formal procurement intent registries and operations pipeline tracker</p>
+                <!-- PROCUREMENT PIPELINE TABLE: full-width with search + pagination -->
+                <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+                    <div class="p-5 border-b border-slate-100 bg-white">
+                        <div class="flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                                <h2 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Procurement Pipeline Indents</h2>
+                                <p class="text-[10px] text-slate-400 mt-0.5">Formal procurement intent registries and operations pipeline tracker</p>
+                            </div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <!-- Search box -->
+                                <div class="relative">
+                                    <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
+                                    <input type="text" id="reqSearch" placeholder="Search indents..." oninput="filterTable('req')"
+                                        class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-44">
+                                </div>
+                                <!-- Status filter -->
+                                <select id="reqStatusFilter" onchange="filterTable('req')" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl focus:outline-none focus:border-indigo-400">
+                                    <option value="">All Statuses</option>
+                                    <option value="Pending">Pending</option>
+                                    <option value="Accepted">Accepted</option>
+                                    <option value="Rejected">Rejected</option>
+                                </select>
+                                <!-- Per-page selector -->
+                                <select id="reqPageSize" onchange="changePageSize('req')" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl focus:outline-none focus:border-indigo-400">
+                                    <option value="15">15 / page</option>
+                                    <option value="50">50 / page</option>
+                                    <option value="100">100 / page</option>
+                                </select>
+                            </div>
                         </div>
-                        <div class="overflow-x-auto">
-                            <table class="w-full text-left border-collapse text-xs">
-                                <thead>
-                                    <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase border-b border-slate-200">
-                                        <th class="p-3 pl-5 whitespace-nowrap">Time Stamp</th>
-                                        <th class="p-3">Item Description</th>
-                                        <th class="p-3 text-center">Qty</th>
-                                        <th class="p-3 text-right whitespace-nowrap">Est. Value</th>
-                                        <th class="p-3">Item Code</th>
-                                        <th class="p-3">Specification</th>
-                                        <th class="p-3 whitespace-nowrap">Requested By</th>
-                                        <th class="p-3 text-center">Status</th>
-                                        <th class="p-3">Communication</th>
-                                        <th class="p-3 text-right pr-5 whitespace-nowrap">Workflow</th>
-                                    </tr>
-                                </thead>
-                                <tbody class="divide-y divide-slate-100 font-medium text-slate-700">
-                                    __REG_ROWS__
-                                </tbody>
-                            </table>
-                        </div>
+                    </div>
+                    <div class="overflow-x-auto">
+                        <table id="reqTable" class="w-full text-left border-collapse text-xs">
+                            <thead>
+                                <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase border-b border-slate-200">
+                                    <th class="p-3 pl-5 whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable('req',0)">Time Stamp <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3 cursor-pointer hover:text-indigo-600" onclick="sortTable('req',1)">Item Description <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',2)">Qty <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3 text-right whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable('req',3)">Est. Value <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3">Item Code</th>
+                                    <th class="p-3">Specification</th>
+                                    <th class="p-3 whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable('req',6)">Requested By <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',7)">Status <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3">Communication</th>
+                                    <th class="p-3 text-right pr-5 whitespace-nowrap">Workflow</th>
+                                </tr>
+                            </thead>
+                            <tbody id="reqTableBody" class="divide-y divide-slate-100 font-medium text-slate-700">
+                                __REG_ROWS__
+                            </tbody>
+                        </table>
+                    </div>
+                    <!-- Pagination bar -->
+                    <div id="reqPaginationBar" class="flex items-center justify-between px-5 py-3 border-t border-slate-100 bg-slate-50/50 text-xs text-slate-500">
+                        <span id="reqPageInfo"></span>
+                        <div class="flex items-center gap-1" id="reqPageButtons"></div>
                     </div>
                 </div>
             </div>
@@ -367,26 +504,46 @@ LAYOUT_HTML = """<!DOCTYPE html>
                 <div class="xl:col-span-2">
                     <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
                         <div class="p-5 border-b border-slate-100 bg-white">
-                            <h2 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Physical Asset Allocations Journal</h2>
-                            <p class="text-[10px] text-slate-400 mt-0.5">Permanent deployment records and site field custodian mapping</p>
+                            <div class="flex flex-wrap items-center justify-between gap-3">
+                                <div>
+                                    <h2 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Physical Asset Allocations Journal</h2>
+                                    <p class="text-[10px] text-slate-400 mt-0.5">Permanent deployment records and site field custodian mapping</p>
+                                </div>
+                                <div class="flex flex-wrap items-center gap-2">
+                                    <div class="relative">
+                                        <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
+                                        <input type="text" id="allocSearch" placeholder="Search allocations..." oninput="filterTable('alloc')"
+                                            class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-40">
+                                    </div>
+                                    <select id="allocPageSize" onchange="changePageSize('alloc')" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl focus:outline-none focus:border-indigo-400">
+                                        <option value="15">15 / page</option>
+                                        <option value="50">50 / page</option>
+                                        <option value="100">100 / page</option>
+                                    </select>
+                                </div>
+                            </div>
                         </div>
                         <div class="overflow-x-auto">
-                            <table class="w-full text-left border-collapse text-xs">
+                            <table id="allocTable" class="w-full text-left border-collapse text-xs">
                                 <thead>
                                     <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase border-b border-slate-200">
-                                        <th class="p-4 pl-5">Date &amp; Time</th>
-                                        <th class="p-4">Item Name</th>
-                                        <th class="p-4 text-center">Quantity</th>
+                                        <th class="p-4 pl-5 cursor-pointer hover:text-indigo-600" onclick="sortTable('alloc',0)">Date &amp; Time <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortTable('alloc',1)">Item Name <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('alloc',2)">Quantity <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 text-center">UOM</th>
-                                        <th class="p-4">Issued To</th>
-                                        <th class="p-4">Department</th>
+                                        <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortTable('alloc',4)">Issued To <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortTable('alloc',5)">Department <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 pr-5">Remarks</th>
                                     </tr>
                                 </thead>
-                                <tbody class="divide-y divide-slate-100 font-medium text-slate-700">
+                                <tbody id="allocTableBody" class="divide-y divide-slate-100 font-medium text-slate-700">
                                     __ASSIGNED_ROWS__
                                 </tbody>
                             </table>
+                        </div>
+                        <div id="allocPaginationBar" class="flex items-center justify-between px-5 py-3 border-t border-slate-100 bg-slate-50/50 text-xs text-slate-500">
+                            <span id="allocPageInfo"></span>
+                            <div class="flex items-center gap-1" id="allocPageButtons"></div>
                         </div>
                     </div>
                 </div>
@@ -411,6 +568,14 @@ LAYOUT_HTML = """<!DOCTYPE html>
 
     <div id="editItemModal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm hidden items-center justify-center z-50 p-4">
         <div id="editItemModalContent" class="bg-white border border-slate-200 p-6 rounded-2xl max-w-lg w-full space-y-4 shadow-2xl text-slate-800"></div>
+    </div>
+
+    <div id="editUserModal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm items-center justify-center z-50 p-4" style="display:none;">
+        <div id="editUserModalContent" class="bg-white border border-slate-200 p-6 rounded-2xl max-w-md w-full space-y-4 shadow-2xl text-slate-800"></div>
+    </div>
+
+    <div id="editEmployeeModal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm items-center justify-center z-50 p-4" style="display:none;">
+        <div id="editEmployeeModalContent" class="bg-white border border-slate-200 p-6 rounded-2xl max-w-md w-full space-y-4 shadow-2xl text-slate-800"></div>
     </div>
 
     <div id="editRequestModal" class="fixed inset-0 bg-slate-900/40 backdrop-blur-sm hidden items-center justify-center z-50 p-4">
@@ -519,15 +684,249 @@ LAYOUT_HTML = """<!DOCTYPE html>
             if (val && val.trim().length > 0) filterMISItems(val);
         }
         // ---- END MIS ITEM SEARCH ----
-        function switchTab(tabId) {
-            // Hide all views cleanly
-            document.getElementById('tab-viewport-inventory').style.display = 'none';
-            document.getElementById('tab-viewport-requisitions').classList.add('hidden');
-            document.getElementById('tab-viewport-requisitions').classList.remove('grid');
-            document.getElementById('tab-viewport-allocations').classList.add('hidden');
-            document.getElementById('tab-viewport-allocations').classList.remove('grid');
 
-            // Reset navigation links styling
+        // ---- TXN ITEM SEARCH ENGINE (Inward Transaction) ----
+        function filterTxnItems(query) {
+            var dropdown = document.getElementById('txn_item_dropdown');
+            if (!dropdown) return;
+            if (!query || query.trim() === '') { dropdown.classList.add('hidden'); return; }
+            var q = query.toLowerCase();
+            var matches = MIS_INVENTORY_DATA.filter(function(i) {
+                return i.name.toLowerCase().includes(q) || i.code.toLowerCase().includes(q);
+            });
+            if (matches.length === 0) {
+                dropdown.innerHTML = '<div class="p-3 text-slate-400 text-xs">No matching items found</div>';
+                dropdown.classList.remove('hidden'); return;
+            }
+            dropdown.innerHTML = matches.slice(0, 10).map(function(i) {
+                var stockColor = i.stock > 0 ? 'text-emerald-600' : 'text-rose-600';
+                var safeName = i.name.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+                var safeCode = i.code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+                return '<div class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 last:border-0 txn-dropdown-item" data-id="' + i.id + '" data-name="' + safeName + '" data-code="' + safeCode + '" data-stock="' + i.stock + '">' +
+                    '<div class="font-semibold text-slate-800 text-xs pointer-events-none">' + safeName + '</div>' +
+                    '<div class="flex gap-2 mt-0.5 pointer-events-none"><span class="font-mono text-[10px] text-slate-400">' + safeCode + '</span><span class="text-[10px] font-bold ' + stockColor + '">Stock: ' + i.stock + '</span></div>' +
+                    '</div>';
+            }).join('');
+            dropdown.classList.remove('hidden');
+        }
+        function showTxnDropdown() {
+            var val = document.getElementById('txn_item_search').value;
+            if (val && val.trim().length > 0) filterTxnItems(val);
+        }
+        function selectTxnItem(id, name, code, stock) {
+            document.getElementById('txn_item_id').value = id;
+            document.getElementById('txn_item_search').value = name + ' (' + code + ')';
+            document.getElementById('txn_item_dropdown').classList.add('hidden');
+            var label = document.getElementById('txn_selected_item_label');
+            label.textContent = 'Selected: ' + name + ' | Stock: ' + stock;
+            label.classList.remove('hidden');
+        }
+        document.addEventListener('click', function(e) {
+            var item = e.target.closest('.txn-dropdown-item');
+            if (item) { selectTxnItem(item.dataset.id, item.dataset.name, item.dataset.code, item.dataset.stock); return; }
+            var dd = document.getElementById('txn_item_dropdown');
+            var sr = document.getElementById('txn_item_search');
+            if (dd && sr && !dd.contains(e.target) && e.target !== sr) dd.classList.add('hidden');
+        });
+        // ---- END TXN ITEM SEARCH ----
+
+        // ---- PROC ITEM SEARCH ENGINE (Procurement Indent) ----
+        function filterProcItems(query) {
+            var dropdown = document.getElementById('proc_item_dropdown');
+            if (!dropdown) return;
+            // Always show NEW option at top
+            var newOpt = '<div class="p-2.5 hover:bg-amber-50 cursor-pointer border-b border-amber-100 proc-dropdown-item font-bold text-amber-700 text-xs" data-id="NEW_PROCUREMENT_AD_HOC" data-name="NEW — Not in Catalog" data-code="" data-stock="">&#10133; NEW ITEM (Not in catalog)</div>';
+            if (!query || query.trim() === '') {
+                dropdown.innerHTML = newOpt + '<div class="p-3 text-slate-400 text-xs">Type to search catalog items...</div>';
+                dropdown.classList.remove('hidden'); return;
+            }
+            var q = query.toLowerCase();
+            var matches = MIS_INVENTORY_DATA.filter(function(i) {
+                return i.name.toLowerCase().includes(q) || i.code.toLowerCase().includes(q);
+            });
+            var itemsHtml = matches.slice(0, 10).map(function(i) {
+                var stockColor = i.stock > 0 ? 'text-emerald-600' : 'text-rose-600';
+                var safeName = i.name.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+                var safeCode = i.code.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+                return '<div class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 last:border-0 proc-dropdown-item" data-id="' + i.id + '" data-name="' + safeName + '" data-code="' + safeCode + '" data-stock="' + i.stock + '">' +
+                    '<div class="font-semibold text-slate-800 text-xs pointer-events-none">' + safeName + '</div>' +
+                    '<div class="flex gap-2 mt-0.5 pointer-events-none"><span class="font-mono text-[10px] text-slate-400">' + safeCode + '</span><span class="text-[10px] font-bold ' + stockColor + '">Stock: ' + i.stock + '</span></div>' +
+                    '</div>';
+            }).join('');
+            dropdown.innerHTML = newOpt + (itemsHtml || '<div class="p-3 text-slate-400 text-xs">No matching items found</div>');
+            dropdown.classList.remove('hidden');
+        }
+        function showProcDropdown() { filterProcItems(document.getElementById('proc_item_search').value); }
+        function selectProcItem(id, name, code, stock) {
+            document.getElementById('proc_item_id').value = id;
+            var isNew = (id === 'NEW_PROCUREMENT_AD_HOC');
+            document.getElementById('proc_item_search').value = isNew ? '' : name + ' (' + code + ')';
+            document.getElementById('proc_item_dropdown').classList.add('hidden');
+            var label = document.getElementById('proc_selected_item_label');
+            if (isNew) {
+                label.textContent = '+ New item — fill details below';
+                label.className = 'text-[10px] text-amber-600 font-semibold mt-1';
+            } else {
+                label.textContent = 'Selected: ' + name + ' | Stock: ' + stock;
+                label.className = 'text-[10px] text-indigo-600 font-semibold mt-1';
+            }
+            var adhoc = document.getElementById('adhoc_procurement_fields_group');
+            if (adhoc) adhoc.style.display = isNew ? 'grid' : 'none';
+        }
+        document.addEventListener('click', function(e) {
+            var item = e.target.closest('.proc-dropdown-item');
+            if (item) { selectProcItem(item.dataset.id, item.dataset.name, item.dataset.code, item.dataset.stock); return; }
+            var dd = document.getElementById('proc_item_dropdown');
+            var sr = document.getElementById('proc_item_search');
+            if (dd && sr && !dd.contains(e.target) && e.target !== sr) dd.classList.add('hidden');
+        });
+        // Initialize proc form state
+        window.addEventListener('DOMContentLoaded', function() {
+            var adhoc = document.getElementById('adhoc_procurement_fields_group');
+            if (adhoc) adhoc.style.display = 'grid'; // default to NEW mode
+            var label = document.getElementById('proc_selected_item_label');
+            if (label) { label.textContent = '+ New item — fill details below or search above'; label.className = 'text-[10px] text-amber-600 font-semibold mt-1'; }
+        });
+        // ---- END PROC ITEM SEARCH ----
+
+        // =====================================================================
+        // UNIVERSAL SEARCH, SORT & PAGINATION ENGINE
+        // =====================================================================
+        var tableState = {
+            inv:   { page: 1, pageSize: 15, sortCol: -1, sortDir: 1, filter: '', extraFilter: '' },
+            req:   { page: 1, pageSize: 15, sortCol: -1, sortDir: 1, filter: '', extraFilter: '' },
+            alloc: { page: 1, pageSize: 15, sortCol: -1, sortDir: 1, filter: '', extraFilter: '' }
+        };
+
+        var tableMap = {
+            inv:   { bodyId: 'invTableBody',   infoId: 'invPageInfo',   btnsId: 'invPageButtons',   sizeId: 'invPageSize',   searchId: 'invSearch' },
+            req:   { bodyId: 'reqTableBody',   infoId: 'reqPageInfo',   btnsId: 'reqPageButtons',   sizeId: 'reqPageSize',   searchId: 'reqSearch' },
+            alloc: { bodyId: 'allocTableBody', infoId: 'allocPageInfo', btnsId: 'allocPageButtons', sizeId: 'allocPageSize', searchId: 'allocSearch' }
+        };
+
+        function getAllRows(key) {
+            var tbody = document.getElementById(tableMap[key].bodyId);
+            if (!tbody) return [];
+            return Array.from(tbody.querySelectorAll('tr[data-row]'));
+        }
+
+        function filterTable(key) {
+            var st = tableState[key];
+            var searchEl = document.getElementById(tableMap[key].searchId);
+            st.filter = searchEl ? searchEl.value.toLowerCase() : '';
+            if (key === 'req') {
+                var sf = document.getElementById('reqStatusFilter');
+                st.extraFilter = sf ? sf.value.toLowerCase() : '';
+            }
+            st.page = 1;
+            renderTable(key);
+        }
+
+        function changePageSize(key) {
+            var sel = document.getElementById(tableMap[key].sizeId);
+            tableState[key].pageSize = parseInt(sel.value);
+            tableState[key].page = 1;
+            renderTable(key);
+        }
+
+        function sortTable(key, col) {
+            var st = tableState[key];
+            if (st.sortCol === col) { st.sortDir *= -1; } else { st.sortCol = col; st.sortDir = 1; }
+            st.page = 1;
+            renderTable(key);
+        }
+
+        function getCellText(row, col) {
+            var cells = row.querySelectorAll('td');
+            if (!cells[col]) return '';
+            return (cells[col].getAttribute('data-sort') || cells[col].innerText || '').trim().toLowerCase();
+        }
+
+        function renderTable(key) {
+            var st = tableState[key];
+            var allRows = getAllRows(key);
+
+            // Filter
+            var filtered = allRows.filter(function(row) {
+                var text = row.getAttribute('data-text') || row.innerText.toLowerCase();
+                var matchSearch = !st.filter || text.includes(st.filter);
+                var matchExtra = true;
+                if (key === 'req' && st.extraFilter) {
+                    var statusCell = row.querySelector('td[data-status]');
+                    matchExtra = statusCell ? statusCell.getAttribute('data-status').toLowerCase() === st.extraFilter : text.includes(st.extraFilter);
+                }
+                return matchSearch && matchExtra;
+            });
+
+            // Sort
+            if (st.sortCol >= 0) {
+                filtered.sort(function(a, b) {
+                    var av = getCellText(a, st.sortCol), bv = getCellText(b, st.sortCol);
+                    var an = parseFloat(av.replace(/[₹,]/g,'')), bn = parseFloat(bv.replace(/[₹,]/g,''));
+                    if (!isNaN(an) && !isNaN(bn)) return (an - bn) * st.sortDir;
+                    return av.localeCompare(bv) * st.sortDir;
+                });
+            }
+
+            // Paginate
+            var total = filtered.length;
+            var totalPages = Math.max(1, Math.ceil(total / st.pageSize));
+            if (st.page > totalPages) st.page = totalPages;
+            var start = (st.page - 1) * st.pageSize;
+            var end = Math.min(start + st.pageSize, total);
+
+            // Show/hide rows
+            allRows.forEach(function(r) { r.style.display = 'none'; });
+            filtered.slice(start, end).forEach(function(r) { r.style.display = ''; });
+
+            // Info
+            var infoEl = document.getElementById(tableMap[key].infoId);
+            if (infoEl) infoEl.textContent = total === 0 ? 'No records found' : 'Showing ' + (start+1) + '–' + end + ' of ' + total + ' records';
+
+            // Page buttons
+            var btnsEl = document.getElementById(tableMap[key].btnsId);
+            if (btnsEl) {
+                var html = '';
+                var btnBase = 'px-2.5 py-1 rounded-lg border text-[10px] font-semibold transition-all ';
+                html += '<button onclick="goPage(\\''+key+'\\','+Math.max(1,st.page-1)+')" class="'+btnBase+'bg-white border-slate-200 hover:bg-indigo-50 text-slate-600">&laquo;</button>';
+                var pStart = Math.max(1, st.page-2), pEnd = Math.min(totalPages, st.page+2);
+                if (pStart > 1) html += '<button onclick="goPage(\\''+key+'\\',1)" class="'+btnBase+'bg-white border-slate-200 hover:bg-indigo-50 text-slate-600">1</button>';
+                if (pStart > 2) html += '<span class="px-1 text-slate-400">…</span>';
+                for (var p = pStart; p <= pEnd; p++) {
+                    var active = p === st.page ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white border-slate-200 hover:bg-indigo-50 text-slate-600';
+                    html += '<button onclick="goPage(\\''+key+'\\','+p+')" class="'+btnBase+active+'">'+p+'</button>';
+                }
+                if (pEnd < totalPages-1) html += '<span class="px-1 text-slate-400">…</span>';
+                if (pEnd < totalPages) html += '<button onclick="goPage(\\''+key+'\\','+totalPages+')" class="'+btnBase+'bg-white border-slate-200 hover:bg-indigo-50 text-slate-600">'+totalPages+'</button>';
+                html += '<button onclick="goPage(\\''+key+'\\','+Math.min(totalPages,st.page+1)+')" class="'+btnBase+'bg-white border-slate-200 hover:bg-indigo-50 text-slate-600">&raquo;</button>';
+                btnsEl.innerHTML = html;
+            }
+        }
+
+        function goPage(key, p) {
+            tableState[key].page = p;
+            renderTable(key);
+        }
+
+        // Tag all rows with data-row and data-text for engine to work
+        function tagRows(bodyId) {
+            var tbody = document.getElementById(bodyId);
+            if (!tbody) return;
+            tbody.querySelectorAll('tr').forEach(function(row) {
+                row.setAttribute('data-row', '1');
+                if (!row.getAttribute('data-text')) {
+                    row.setAttribute('data-text', row.innerText.toLowerCase());
+                }
+            });
+        }
+
+        function switchTab(tabId) {
+            document.getElementById('tab-viewport-inventory').style.display = 'none';
+            var reqEl = document.getElementById('tab-viewport-requisitions');
+            reqEl.classList.add('hidden'); reqEl.classList.remove('flex');
+            var allocEl = document.getElementById('tab-viewport-allocations');
+            allocEl.classList.add('hidden'); allocEl.classList.remove('grid');
+
             const tabs = ['inventory', 'requisitions', 'allocations'];
             tabs.forEach(t => {
                 const el = document.getElementById('nav-' + t);
@@ -538,29 +937,29 @@ LAYOUT_HTML = """<!DOCTYPE html>
                 }
             });
 
-            // Activate chosen target viewport
             const activeNav = document.getElementById('nav-' + tabId);
             const breadcrumb = document.getElementById('header-breadcrumb');
-            
+
             if (tabId === 'inventory') {
                 document.getElementById('tab-viewport-inventory').style.display = 'grid';
                 breadcrumb.innerText = "Inventory Status Dashboard";
                 activeNav.className = "w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left";
                 activeNav.querySelector('i').className = "fa-solid fa-boxes-stacked w-5 text-center text-indigo-600";
+                tagRows('invTableBody'); renderTable('inv');
             } else if (tabId === 'requisitions') {
-                document.getElementById('tab-viewport-requisitions').classList.remove('hidden');
-                document.getElementById('tab-viewport-requisitions').classList.add('grid');
+                reqEl.classList.remove('hidden'); reqEl.classList.add('flex');
                 breadcrumb.innerText = "Material Procurement Indents";
                 activeNav.className = "w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left";
                 activeNav.querySelector('i').className = "fa-solid fa-file-invoice-dollar w-5 text-center text-indigo-600";
+                tagRows('reqTableBody'); renderTable('req');
             } else if (tabId === 'allocations') {
-                document.getElementById('tab-viewport-allocations').classList.remove('hidden');
-                document.getElementById('tab-viewport-allocations').classList.add('grid');
+                allocEl.classList.remove('hidden'); allocEl.classList.add('grid');
                 breadcrumb.innerText = "Physical Asset Allocations & Issue Logs";
                 activeNav.className = "w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left";
                 activeNav.querySelector('i').className = "fa-solid fa-truck-ramp-box w-5 text-center text-indigo-600";
+                tagRows('allocTableBody'); renderTable('alloc');
             }
-            
+
             window.location.hash = tabId + "-panel";
         }
 
@@ -587,35 +986,45 @@ LAYOUT_HTML = """<!DOCTYPE html>
 
         function openEditItemModal(id, name, code, price, stock, minStock) {
     var modalHtml = `
-        <h3 class="text-xs font-bold uppercase text-slate-900 tracking-wider border-b border-slate-100 pb-3">Modify Master Inventory Item</h3>
+        <h3 class="text-xs font-bold uppercase text-slate-900 tracking-wider border-b border-slate-100 pb-3">&#9998; Modify Master Inventory Item</h3>
         <form action="/items/edit/${id}" method="POST" class="space-y-4 text-xs text-slate-700">
             <div class="grid grid-cols-2 gap-3">
                 <div>
                     <label class="block font-semibold text-slate-600 mb-1.5">Item Name</label>
-                    <input type="text" name="name" value="${name}" required class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 focus:outline-none">
+                    <input type="text" name="name" value="${name}" required
+                        class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 focus:outline-none focus:border-indigo-600 focus:bg-white">
                 </div>
                 <div>
-                    <label class="block font-semibold text-slate-600 mb-1.5">Unique Code</label>
-                    <input type="text" name="item_code" value="${code}" readonly class="w-full bg-slate-100 border border-slate-200 p-2.5 rounded-xl text-slate-500 font-mono">
+                    <label class="block font-bold text-indigo-700 mb-1.5">&#9670; Unique Code <span class="text-rose-500">*</span></label>
+                    <input type="text" name="item_code" value="${code}" required
+                        class="w-full bg-white border-2 border-indigo-400 p-2.5 rounded-xl text-slate-900 font-mono focus:outline-none focus:border-indigo-600 focus:ring-2 focus:ring-indigo-100 uppercase"
+                        oninput="this.value=this.value.toUpperCase()"
+                        placeholder="e.g. EIPL-ST-05">
+                    <p class="text-[10px] text-indigo-500 mt-0.5 font-medium">&#9998; Click to edit — must be unique</p>
                 </div>
             </div>
             <div class="grid grid-cols-3 gap-3">
                 <div>
-                    <label class="block font-semibold text-slate-600 mb-1.5">Price (₹)</label>
-                    <input type="number" step="0.01" name="price" value="${price}" required class="w-full bg-slate-50 border p-2.5 rounded-xl font-mono">
+                    <label class="block font-semibold text-slate-600 mb-1.5">Price (&#8377;)</label>
+                    <input type="number" step="0.01" name="price" value="${price}" required
+                        class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl font-mono focus:outline-none focus:border-indigo-600 focus:bg-white">
                 </div>
                 <div>
                     <label class="block font-semibold text-slate-600 mb-1.5">Stock Count</label>
-                    <input type="number" name="current_stock" value="${stock}" required class="w-full bg-slate-50 border p-2.5 rounded-xl font-mono">
+                    <input type="number" name="current_stock" value="${stock}" required
+                        class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl font-mono focus:outline-none focus:border-indigo-600 focus:bg-white">
                 </div>
                 <div>
                     <label class="block font-semibold text-slate-600 mb-1.5">Safety Min</label>
-                    <input type="number" name="minimum_stock" value="${minStock}" required class="w-full bg-slate-50 border p-2.5 rounded-xl font-mono">
+                    <input type="number" name="minimum_stock" value="${minStock}" required
+                        class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl font-mono focus:outline-none focus:border-indigo-600 focus:bg-white">
                 </div>
             </div>
-            <div class="flex gap-3 pt-2">
-                <button type="button" onclick="closeEditItemModal()" class="w-1/2 bg-slate-100 text-slate-700 p-2.5 rounded-xl border">Cancel</button>
-                <button type="submit" class="w-1/2 bg-indigo-600 text-white p-2.5 rounded-xl font-bold">Save Modifications</button>
+            <div class="flex gap-3 pt-2 border-t border-slate-100">
+                <button type="button" onclick="closeEditItemModal()"
+                    class="w-1/2 bg-slate-100 hover:bg-slate-200 text-slate-700 p-2.5 rounded-xl border border-slate-200 font-bold transition-all">Cancel</button>
+                <button type="submit"
+                    class="w-1/2 bg-amber-500 hover:bg-amber-600 text-white p-2.5 rounded-xl font-bold transition-all shadow-md shadow-amber-500/20">&#10003; Save Changes</button>
             </div>
         </form>
     `;
@@ -632,6 +1041,90 @@ LAYOUT_HTML = """<!DOCTYPE html>
             }
             document.getElementById('editRequestModal').style.display = 'flex';
         }
+
+        // ---- EDIT USER MODAL (Grant User Access panel) ----
+        function openEditUserModal(id, fullName, designation, location, role) {
+            var esc = function(s) { return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); };
+            var modalHtml = `
+                <h3 class="text-xs font-bold uppercase text-slate-900 tracking-wider border-b border-slate-100 pb-3">&#9998; Modify User Account</h3>
+                <form action="/admin/users/edit/${id}" method="POST" class="space-y-4 text-xs text-slate-700">
+                    <div>
+                        <label class="block font-semibold text-slate-600 mb-1.5">Full Legal Name</label>
+                        <input type="text" name="full_name" value="${esc(fullName)}" required
+                            class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 focus:outline-none focus:border-indigo-600 focus:bg-white">
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="block font-semibold text-slate-600 mb-1.5">Designation</label>
+                            <input type="text" name="designation" value="${esc(designation)}" required
+                                class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 focus:outline-none focus:border-indigo-600 focus:bg-white">
+                        </div>
+                        <div>
+                            <label class="block font-semibold text-slate-600 mb-1.5">Workstation Location</label>
+                            <input type="text" name="workstation_location" value="${esc(location)}" required
+                                class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 focus:outline-none focus:border-indigo-600 focus:bg-white">
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block font-semibold text-slate-600 mb-1.5">Access Role</label>
+                        <select name="role" class="w-full bg-white font-bold border border-slate-200 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600">
+                            <option value="Staff" ${role === 'Staff' ? 'selected' : ''}>Staff Level</option>
+                            <option value="Admin" ${role === 'Admin' ? 'selected' : ''}>Full Admin</option>
+                        </select>
+                    </div>
+                    <div class="flex gap-3 pt-2 border-t border-slate-100">
+                        <button type="button" onclick="closeEditUserModal()"
+                            class="w-1/2 bg-slate-100 hover:bg-slate-200 text-slate-700 p-2.5 rounded-xl border border-slate-200 font-bold transition-all">Cancel</button>
+                        <button type="submit"
+                            class="w-1/2 bg-indigo-600 hover:bg-indigo-700 text-white p-2.5 rounded-xl font-bold transition-all shadow-md">&#10003; Save Changes</button>
+                    </div>
+                </form>
+            `;
+            document.getElementById('editUserModalContent').innerHTML = modalHtml;
+            document.getElementById('editUserModal').style.display = 'flex';
+        }
+        function closeEditUserModal() { document.getElementById('editUserModal').style.display = 'none'; }
+
+        // ---- EDIT EMPLOYEE MODAL (Employee Registration panel) ----
+        function openEditEmployeeModal(id, name, roleTitle, location, contact) {
+            var esc = function(s) { return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); };
+            var modalHtml = `
+                <h3 class="text-xs font-bold uppercase text-slate-900 tracking-wider border-b border-slate-100 pb-3">&#9998; Modify Employee Record</h3>
+                <form action="/employees/edit/${id}" method="POST" class="space-y-4 text-xs text-slate-700">
+                    <div>
+                        <label class="block font-semibold text-slate-600 mb-1.5">Employee Full Name</label>
+                        <input type="text" name="name" value="${esc(name)}" required
+                            class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 focus:outline-none focus:border-indigo-600 focus:bg-white">
+                    </div>
+                    <div>
+                        <label class="block font-semibold text-slate-600 mb-1.5">Designation / Role</label>
+                        <input type="text" name="role_title" value="${esc(roleTitle)}" required
+                            class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 focus:outline-none focus:border-indigo-600 focus:bg-white">
+                    </div>
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="block font-semibold text-slate-600 mb-1.5">Work Station Location</label>
+                            <input type="text" name="location" value="${esc(location)}" required
+                                class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 focus:outline-none focus:border-indigo-600 focus:bg-white">
+                        </div>
+                        <div>
+                            <label class="block font-semibold text-slate-600 mb-1.5">Contact Mobile</label>
+                            <input type="text" name="contact" value="${esc(contact)}" required
+                                class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 focus:outline-none focus:border-indigo-600 focus:bg-white">
+                        </div>
+                    </div>
+                    <div class="flex gap-3 pt-2 border-t border-slate-100">
+                        <button type="button" onclick="closeEditEmployeeModal()"
+                            class="w-1/2 bg-slate-100 hover:bg-slate-200 text-slate-700 p-2.5 rounded-xl border border-slate-200 font-bold transition-all">Cancel</button>
+                        <button type="submit"
+                            class="w-1/2 bg-slate-800 hover:bg-slate-900 text-white p-2.5 rounded-xl font-bold transition-all shadow-md">&#10003; Save Changes</button>
+                    </div>
+                </form>
+            `;
+            document.getElementById('editEmployeeModalContent').innerHTML = modalHtml;
+            document.getElementById('editEmployeeModal').style.display = 'flex';
+        }
+        function closeEditEmployeeModal() { document.getElementById('editEmployeeModal').style.display = 'none'; }
 
         function downloadTransactionCSVTemplate() {
             var csvContent = "item_code,type,quantity\\nEIPL-BM-01,IN,50\\nEIPL-WR-09,OUT,12";
@@ -650,21 +1143,56 @@ LAYOUT_HTML = """<!DOCTYPE html>
         }
 
         function downloadInventoryExcel() {
-            var csv = [];
-            var rows = document.querySelectorAll("#inventoryTable tr");
-            for (var i = 0; i < rows.length; i++) {
-                var row = [], cols = rows[i].querySelectorAll("td, th");
-                for (var j = 0; j < cols.length - 1; j++) {
-                    var cleanText = cols[j].innerText.replace(/\\n/g, '').replace(/⚠️ LOW/g, '').trim();
-                    row.push('"' + cleanText.replace(/"/g, '""') + '"');
-                }
-                csv.push(row.join(","));
+            // Build CSV matching exact table headers and data
+            var isAdmin = __IS_ADMIN__;
+            var headers = ['Item Name', 'Item Code'];
+            if (isAdmin) { headers.push('Vendor / Supplier', 'Price (INR)'); }
+            headers.push('Current Stock', 'Safety Stock');
+
+            var rows = [headers];
+            var tbody = document.getElementById('invTableBody');
+            if (tbody) {
+                tbody.querySelectorAll('tr[data-row]').forEach(function(row) {
+                    var cells = row.querySelectorAll('td');
+                    if (!cells.length) return;
+                    var rowData = [];
+                    // Item Name (strip LOW badge and category sub-text)
+                    var nameCell = cells[0] ? cells[0].innerText.replace(/LOW/g,'').replace(/\\n/g,' ').trim() : '';
+                    rowData.push(nameCell);
+                    // Item Code
+                    rowData.push(cells[1] ? cells[1].innerText.trim() : '');
+                    if (isAdmin) {
+                        // Vendor
+                        rowData.push(cells[2] ? cells[2].innerText.trim() : '');
+                        // Price — strip ₹ and commas
+                        rowData.push(cells[3] ? cells[3].innerText.replace(/[₹,]/g,'').trim() : '');
+                        // Current Stock
+                        rowData.push(cells[4] ? cells[4].innerText.trim() : '');
+                        // Safety Stock
+                        rowData.push(cells[5] ? cells[5].innerText.trim() : '');
+                    } else {
+                        // Current Stock (col 2 for staff view)
+                        rowData.push(cells[2] ? cells[2].innerText.trim() : '');
+                        // Safety Stock
+                        rowData.push(cells[3] ? cells[3].innerText.trim() : '');
+                    }
+                    rows.push(rowData);
+                });
             }
-            var csvContent = "data:text/csv;charset=utf-8," + csv.join("\\n");
-            var encodedUri = encodeURI(csvContent);
-            var link = document.createElement("a");
-            link.setAttribute("href", encodedUri);
-            link.setAttribute("download", "EIPL_Master_Inventory_Report.csv");
+
+            var csvContent = rows.map(function(r) {
+                return r.map(function(cell) {
+                    var val = (cell || '').toString().replace(/"/g, '""');
+                    return '"' + val + '"';
+                }).join(',');
+            }).join('\\n');
+
+            // Add BOM for Excel UTF-8 compatibility
+            var BOM = '\\uFEFF';
+            var blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' });
+            var link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = 'EIPL_Consolidated_Inventory_' + new Date().toISOString().slice(0,10) + '.csv';
             document.body.appendChild(link);
             link.click();
             document.body.removeChild(link);

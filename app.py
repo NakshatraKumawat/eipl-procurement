@@ -18,6 +18,12 @@ models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="EIPL Enterprise Procurement Framework")
 
+# Serve static assets (company logo etc.) from ./static folder
+import os as _os
+from fastapi.staticfiles import StaticFiles
+_os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 # -------------------------------------------------------------
 # 1. FIXED EXPLICIT ROUTE FOR FAVICON TO BYPASS 404 EXCEPTIONS
@@ -91,6 +97,12 @@ def run_structural_database_migrations():
             )
         """))
         db2.commit()
+        # Add received_by to grn_records if missing
+        try:
+            db2.execute(text("ALTER TABLE grn_records ADD COLUMN received_by TEXT"))
+            db2.commit()
+        except Exception:
+            pass
         db2.close()
     except Exception as e:
         print(f"[Migration] procurement_messages: {e}")
@@ -172,6 +184,7 @@ async def create_transaction(
     item_id: int = Form(...),
     quantity: int = Form(...),
     uom: str = Form(...),
+    received_by: str = Form(...),
     grn_file: UploadFile = File(...),
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -215,6 +228,7 @@ async def create_transaction(
         item_id=item.id,
         quantity=quantity,
         uom=uom,
+        received_by=received_by,
         grn_filename=safe_filename,
         uploaded_by_id=current_user.id
     ))
@@ -466,6 +480,22 @@ async def items_bulk_import(
         db.rollback()
         print(f"[Bulk Import Critical Exception]: {str(e)}")
         return HTMLResponse(f"<script>alert('Import processing error: {str(e)}'); window.location='/';</script>")
+
+
+@app.get("/items/bulk-template")
+def items_bulk_template(current_user: models.User = Depends(get_current_user)):
+    if not current_user or current_user.role != "Admin":
+        return RedirectResponse(url="/login", status_code=303)
+    from fastapi.responses import StreamingResponse
+    import io
+    csv_content = "name,item_code,initial_stock,price,vendor,site\n"
+    csv_content += "Steel Pipe 25mm,EIPL-ST-01,50,350.00,Tata Steel,Udaipur Yard\n"
+    csv_content += "Copper Cable 4mm,EIPL-CC-02,100,125.50,Polycab,Store Room A\n"
+    return StreamingResponse(
+        io.StringIO(csv_content),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=EIPL_Items_Bulk_Template.csv"}
+    )
 
 
 @app.post("/items/add")
@@ -1057,6 +1087,287 @@ def delete_employee(emp_id: int, current_user: models.User = Depends(get_current
     return RedirectResponse(url="/", status_code=303)
 
 
+@app.get("/inventory/summary", response_class=HTMLResponse)
+def inventory_summary(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    items = db.query(models.Item).all()
+    transactions = db.query(models.Transaction).all()
+    assignments = db.query(models.MaterialAssignment).all()
+    grns = db.query(models.GRNRecord).all()
+
+    import json as _json, html as _html
+
+    # Build transaction log per item
+    txn_map = {}
+    for t in transactions:
+        if t.item_id not in txn_map:
+            txn_map[t.item_id] = []
+        txn_map[t.item_id].append({
+            "date": t.timestamp.strftime("%d-%m-%Y %H:%M") if t.timestamp else "",
+            "type": t.type,
+            "qty": t.quantity,
+            "uom": "—",
+            "person": "—",
+            "direction": "IN" if t.type in ("IN","IN_PO") else "OUT"
+        })
+
+    # Overlay GRN data (received_by, uom) onto IN transactions
+    grn_map = {}
+    for g in grns:
+        grn_map[g.item_id] = grn_map.get(g.item_id, [])
+        grn_map[g.item_id].append({
+            "date": g.timestamp.strftime("%d-%m-%Y %H:%M") if g.timestamp else "",
+            "type": "IN",
+            "qty": g.quantity,
+            "uom": g.uom or "Nos",
+            "person": getattr(g, 'received_by', '') or (g.uploader.username if g.uploader else "—"),
+            "direction": "IN"
+        })
+
+    # Overlay material assignments (OUT)
+    for a in assignments:
+        if a.item_id not in txn_map:
+            txn_map[a.item_id] = []
+        txn_map[a.item_id].append({
+            "date": a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "",
+            "type": "OUT",
+            "qty": a.quantity,
+            "uom": a.uom or "Nos",
+            "person": a.issued_to or "—",
+            "direction": "OUT"
+        })
+
+    rows_html = ""
+    for it in items:
+        item_cat = getattr(it, 'category', '—')
+        item_sup = getattr(it, 'supplier', '—')
+        low_badge = ' <span class="text-rose-500 font-black text-[9px] animate-pulse">LOW</span>' if it.current_stock <= it.minimum_stock else ""
+
+        # Build txn log: merge GRN entries + assignments, sort by date desc
+        all_txns = grn_map.get(it.id, []) + [t for t in txn_map.get(it.id, []) if t["direction"] == "OUT"]
+        all_txns.sort(key=lambda x: x["date"], reverse=True)
+
+        txn_rows = ""
+        for tx in all_txns:
+            color = "text-emerald-600 bg-emerald-50" if tx["direction"] == "IN" else "text-rose-600 bg-rose-50"
+            person_label = f"<span class='text-slate-500'>Recv: {_html.escape(tx['person'])}</span>" if tx["direction"] == "IN" else f"<span class='text-slate-500'>Issued: {_html.escape(tx['person'])}</span>"
+            txn_rows += f"""<tr class='border-b border-slate-100 text-[11px]'>
+                <td class='px-3 py-2 font-mono text-slate-400'>{tx['date']}</td>
+                <td class='px-3 py-2'><span class='font-bold px-1.5 py-0.5 rounded {color}'>{tx['type']}</span></td>
+                <td class='px-3 py-2 font-mono font-bold'>{tx['qty']}</td>
+                <td class='px-3 py-2 text-slate-500'>{tx['uom']}</td>
+                <td class='px-3 py-2'>{person_label}</td>
+            </tr>"""
+
+        if not txn_rows:
+            txn_rows = "<tr><td colspan='5' class='px-3 py-4 text-center text-slate-400 text-[11px]'>No transactions recorded.</td></tr>"
+
+        txn_json = _json.dumps(all_txns)
+        safe_name = _html.escape(it.name)
+        safe_code = _html.escape(it.item_code)
+
+        rows_html += f"""<tr class="border-b border-slate-100 hover:bg-slate-50/50 text-xs" data-name="{safe_name.lower()}" data-code="{safe_code.lower()}" data-supplier="{_html.escape(item_sup).lower()}">
+            <td class="p-3 font-semibold text-slate-900">{safe_name}{low_badge}<div class="text-[10px] text-slate-400">{item_cat}</div></td>
+            <td class="p-3 font-mono text-slate-500 text-[11px]">{safe_code}</td>
+            <td class="p-3 text-slate-600 text-[11px]">{item_sup}</td>
+            <td class="p-3 font-mono text-slate-700">&#8377;{it.price:,.2f}</td>
+            <td class="p-3 font-mono font-bold text-center {'text-rose-600' if it.current_stock <= it.minimum_stock else 'text-slate-900'}">{it.current_stock}</td>
+            <td class="p-3 font-mono text-center text-slate-400">{it.minimum_stock}</td>
+            <td class="p-3 text-center">
+                <button onclick="openTxnLog({it.id}, '{safe_name}', '{safe_code}')"
+                    class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all flex items-center gap-1 mx-auto">
+                    <i class="fa-solid fa-book-open text-[9px]"></i> Log
+                </button>
+            </td>
+        </tr>
+        <script>window.__txnData = window.__txnData||{{}};window.__txnData[{it.id}]={txn_json};</script>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><title>Inventory Summary - EIPL</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>body{{font-family:'Inter',sans-serif;}}
+.modal-bg{{position:fixed;inset:0;background:rgba(15,23,42,0.5);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:999;}}
+</style>
+</head>
+<body class="bg-slate-50 min-h-screen">
+<div class="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between sticky top-0 z-10 shadow-sm">
+    <div class="flex items-center gap-3">
+        <a href="/" class="text-indigo-600 hover:text-indigo-800 text-xs font-bold flex items-center gap-1"><i class="fa-solid fa-arrow-left"></i> Dashboard</a>
+        <span class="text-slate-300">|</span>
+        <h1 class="text-sm font-black text-slate-900 uppercase tracking-wider"><i class="fa-solid fa-chart-bar text-indigo-600 mr-1"></i> Inventory Summary</h1>
+    </div>
+    <div class="flex items-center gap-2">
+        <div class="relative">
+            <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
+            <input type="text" id="summarySearch" placeholder="Search items..." oninput="filterSummary()"
+                class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-48">
+        </div>
+        <select id="summaryPageSize" onchange="renderPage()" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl">
+            <option value="15">15 / page</option>
+            <option value="50">50 / page</option>
+            <option value="100">100 / page</option>
+        </select>
+        <select id="stockFilter" onchange="filterSummary()" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl">
+            <option value="">All Stock</option>
+            <option value="low">Low Stock Only</option>
+            <option value="ok">Adequate Stock</option>
+        </select>
+    </div>
+</div>
+
+<div class="max-w-[1400px] mx-auto p-6">
+    <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+        <table class="w-full text-left border-collapse" id="summaryTable">
+            <thead>
+                <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase text-xs border-b border-slate-200">
+                    <th class="p-4 pl-5 cursor-pointer hover:text-indigo-600" onclick="sortSummary(0)">Item Name <i class="fa-solid fa-sort text-[9px]"></i></th>
+                    <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortSummary(1)">Item Code <i class="fa-solid fa-sort text-[9px]"></i></th>
+                    <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortSummary(2)">Vendor <i class="fa-solid fa-sort text-[9px]"></i></th>
+                    <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortSummary(3)">Price <i class="fa-solid fa-sort text-[9px]"></i></th>
+                    <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortSummary(4)">Current Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
+                    <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortSummary(5)">Safety Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
+                    <th class="p-4 text-center">Transaction Log</th>
+                </tr>
+            </thead>
+            <tbody id="summaryBody">{rows_html}</tbody>
+        </table>
+        <div class="flex items-center justify-between px-5 py-3 border-t border-slate-100 bg-slate-50/50 text-xs text-slate-500">
+            <span id="summaryInfo"></span>
+            <div id="summaryPagination" class="flex items-center gap-1"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Transaction Log Modal -->
+<div id="txnModal" class="modal-bg hidden">
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-2xl mx-4 flex flex-col max-h-[80vh]">
+        <div class="flex items-center justify-between p-5 border-b border-slate-100">
+            <div>
+                <h3 class="text-sm font-black text-slate-900" id="txnModalTitle">Transaction Log</h3>
+                <p class="text-[10px] text-slate-400 mt-0.5" id="txnModalSubtitle"></p>
+            </div>
+            <button onclick="closeTxnLog()" class="text-slate-400 hover:text-slate-700 p-1.5 rounded-lg hover:bg-slate-100 transition-all">
+                <i class="fa-solid fa-xmark text-sm"></i>
+            </button>
+        </div>
+        <div class="overflow-y-auto flex-1">
+            <table class="w-full text-left border-collapse text-xs">
+                <thead class="sticky top-0">
+                    <tr class="bg-slate-50 text-slate-500 font-semibold uppercase tracking-wider border-b border-slate-200">
+                        <th class="px-4 py-3">Date</th>
+                        <th class="px-4 py-3">Type</th>
+                        <th class="px-4 py-3 text-center">Quantity</th>
+                        <th class="px-4 py-3">UOM</th>
+                        <th class="px-4 py-3">Person</th>
+                    </tr>
+                </thead>
+                <tbody id="txnLogBody"></tbody>
+            </table>
+        </div>
+        <div class="p-4 border-t border-slate-100 flex justify-end">
+            <button onclick="closeTxnLog()" class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-4 py-2 rounded-xl transition-all">Close</button>
+        </div>
+    </div>
+</div>
+
+<script>
+var allRows = Array.from(document.querySelectorAll('#summaryBody tr[data-name]'));
+var filtered = allRows;
+var currentPage = 1;
+var sortCol = -1, sortDir = 1;
+
+function filterSummary() {{
+    var q = document.getElementById('summarySearch').value.toLowerCase();
+    var sf = document.getElementById('stockFilter').value;
+    filtered = allRows.filter(function(r) {{
+        var matchText = !q || r.dataset.name.includes(q) || r.dataset.code.includes(q) || r.dataset.supplier.includes(q);
+        var stocks = r.querySelectorAll('td');
+        var cur = parseInt(stocks[4] ? stocks[4].textContent : '0') || 0;
+        var safe = parseInt(stocks[5] ? stocks[5].textContent : '0') || 0;
+        var matchStock = !sf || (sf === 'low' ? cur <= safe : cur > safe);
+        return matchText && matchStock;
+    }});
+    currentPage = 1;
+    renderPage();
+}}
+
+function renderPage() {{
+    var ps = parseInt(document.getElementById('summaryPageSize').value) || 15;
+    var total = filtered.length;
+    var pages = Math.max(1, Math.ceil(total / ps));
+    if (currentPage > pages) currentPage = pages;
+    var start = (currentPage - 1) * ps;
+    var end = Math.min(start + ps, total);
+    allRows.forEach(function(r) {{ r.style.display = 'none'; }});
+    // Also hide script tags between rows
+    document.querySelectorAll('#summaryBody script').forEach(function(s) {{ s.style.display = 'none'; }});
+    for (var i = start; i < end; i++) {{ filtered[i].style.display = ''; }}
+    document.getElementById('summaryInfo').textContent = 'Showing ' + (start+1) + '-' + end + ' of ' + total + ' items';
+    var pb = document.getElementById('summaryPagination');
+    pb.innerHTML = '';
+    for (var p = 1; p <= pages; p++) {{
+        var btn = document.createElement('button');
+        btn.textContent = p;
+        btn.className = 'px-2.5 py-1 rounded-lg text-xs font-bold transition-all ' + (p === currentPage ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-indigo-50 hover:text-indigo-600');
+        btn.onclick = (function(pg) {{ return function() {{ currentPage = pg; renderPage(); }}; }})(p);
+        pb.appendChild(btn);
+    }}
+}}
+
+function sortSummary(col) {{
+    if (sortCol === col) sortDir = -sortDir; else {{ sortCol = col; sortDir = 1; }}
+    filtered.sort(function(a, b) {{
+        var at = a.querySelectorAll('td')[col] ? a.querySelectorAll('td')[col].textContent.trim() : '';
+        var bt = b.querySelectorAll('td')[col] ? b.querySelectorAll('td')[col].textContent.trim() : '';
+        var an = parseFloat(at.replace(/[^0-9.-]/g,'')), bn = parseFloat(bt.replace(/[^0-9.-]/g,''));
+        if (!isNaN(an) && !isNaN(bn)) return (an - bn) * sortDir;
+        return at.localeCompare(bt) * sortDir;
+    }});
+    renderPage();
+}}
+
+function openTxnLog(itemId, name, code) {{
+    document.getElementById('txnModalTitle').textContent = name + ' — Transaction Log';
+    document.getElementById('txnModalSubtitle').textContent = 'Code: ' + code;
+    var data = (window.__txnData && window.__txnData[itemId]) || [];
+    var tbody = document.getElementById('txnLogBody');
+    if (!data.length) {{
+        tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-6 text-center text-slate-400">No transactions found.</td></tr>';
+    }} else {{
+        tbody.innerHTML = data.map(function(tx) {{
+            var color = tx.direction === 'IN' ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700';
+            var label = tx.direction === 'IN' ? 'Received by: ' : 'Issued to: ';
+            return '<tr class="border-b border-slate-100 hover:bg-slate-50">' +
+                '<td class="px-4 py-2.5 font-mono text-slate-400 text-[11px]">' + tx.date + '</td>' +
+                '<td class="px-4 py-2.5"><span class="font-bold px-2 py-0.5 rounded text-[11px] ' + color + '">' + tx.type + '</span></td>' +
+                '<td class="px-4 py-2.5 font-mono font-bold text-center">' + tx.qty + '</td>' +
+                '<td class="px-4 py-2.5 text-slate-500">' + tx.uom + '</td>' +
+                '<td class="px-4 py-2.5 text-slate-600 text-[11px]">' + label + '<b>' + tx.person + '</b></td>' +
+            '</tr>';
+        }}).join('');
+    }}
+    document.getElementById('txnModal').classList.remove('hidden');
+}}
+
+function closeTxnLog() {{
+    document.getElementById('txnModal').classList.add('hidden');
+}}
+
+document.getElementById('txnModal').addEventListener('click', function(e) {{
+    if (e.target === this) closeTxnLog();
+}});
+
+renderPage();
+</script>
+</body></html>"""
+    return HTMLResponse(html)
+
+
 @app.get("/", response_class=HTMLResponse)
 def root_dashboard(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not current_user:
@@ -1118,44 +1429,60 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         `;
     };
 
-    // 2. THE EDIT ITEM MENU
+    // 2. THE EDIT ITEM MENU — styled to match Procure widget panel
     window.openEditItemModal = function(id, name, Unique_code, price, current_stock, minimum_stock) {
         let modal = document.getElementById('dynamicEditItemModal');
         if (!modal) {
             modal = document.createElement('div');
             modal.id = 'dynamicEditItemModal';
             modal.className = 'fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-50';
+            modal.onclick = function(e) { if (e.target === modal) modal.remove(); };
             document.body.appendChild(modal);
         }
         modal.innerHTML = `
-            <div class="bg-white rounded-xl border border-slate-200 shadow-2xl w-full max-w-md p-6 text-left relative">
-                <h3 class="text-lg font-bold text-slate-900 mb-4 flex items-center gap-2" style="font-size: 1.125rem; font-weight: 700; color: #0f172a; margin-bottom: 1rem;">✏️ Edit Inventory Item</h3>
-                <form action="/items/edit/` + id + `" method="POST" style="display: flex; flex-direction: column; gap: 1rem;">
+            <div style="background:#fff;border-radius:1rem;border:1px solid #e2e8f0;box-shadow:0 25px 50px -12px rgba(0,0,0,0.25);width:100%;max-width:28rem;padding:1.5rem;text-align:left;position:relative;">
+                <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #f1f5f9;padding-bottom:0.75rem;margin-bottom:1.25rem;">
                     <div>
-                        <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #4338ca; text-transform: uppercase; margin-bottom: 0.25rem;">✏️ Unique Code</label>
-                        <input type="text" name="item_code" value="` + Unique_code + `" required style="width: 100%; padding: 0.5rem 0.75rem; border: 2px solid #6366f1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #0f172a; background-color: #ffffff; cursor: text;">
+                        <h3 style="font-size:0.75rem;font-weight:800;color:#0f172a;text-transform:uppercase;letter-spacing:0.05em;">&#9998; Edit Inventory Item</h3>
+                        <p style="font-size:0.625rem;color:#94a3b8;margin-top:0.125rem;">Update item details and stock levels</p>
+                    </div>
+                    <button type="button" onclick="document.getElementById('dynamicEditItemModal').remove()"
+                        style="color:#94a3b8;background:#f8fafc;border:none;border-radius:0.5rem;padding:0.375rem 0.5rem;cursor:pointer;font-size:0.75rem;">&#10005;</button>
+                </div>
+                <form action="/items/edit/` + id + `" method="POST" style="display:flex;flex-direction:column;gap:0.875rem;">
+                    <div>
+                        <label style="display:block;font-size:0.65rem;font-weight:700;color:#4338ca;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.25rem;">&#9670; Unique Item Code</label>
+                        <input type="text" name="item_code" value="` + Unique_code + `" required
+                            style="width:100%;padding:0.625rem 0.75rem;border:2px solid #6366f1;border-radius:0.625rem;font-size:0.8rem;font-family:monospace;color:#0f172a;background:#fafafa;box-sizing:border-box;text-transform:uppercase;"
+                            oninput="this.value=this.value.toUpperCase()">
                     </div>
                     <div>
-                        <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Item Name</label>
-                        <input type="text" name="name" value="` + name + `" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; color: #0f172a; background-color: #ffffff; cursor: text;">
+                        <label style="display:block;font-size:0.65rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.25rem;">Item Name</label>
+                        <input type="text" name="name" value="` + name + `" required
+                            style="width:100%;padding:0.625rem 0.75rem;border:1px solid #e2e8f0;border-radius:0.625rem;font-size:0.8rem;color:#0f172a;background:#f8fafc;box-sizing:border-box;">
                     </div>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;">
                         <div>
-                            <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Price (₹)</label>
-                            <input type="number" step="0.01" name="price" value="` + price + `" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #1e293b;">
+                            <label style="display:block;font-size:0.65rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.25rem;">Price (&#8377;)</label>
+                            <input type="number" step="0.01" name="price" value="` + price + `" required
+                                style="width:100%;padding:0.625rem 0.75rem;border:1px solid #e2e8f0;border-radius:0.625rem;font-size:0.8rem;font-family:monospace;color:#1e293b;box-sizing:border-box;">
                         </div>
                         <div>
-                            <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Safety Stock</label>
-                            <input type="number" name="minimum_stock" value="` + minimum_stock + `" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #1e293b;">
+                            <label style="display:block;font-size:0.65rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.25rem;">Safety Stock</label>
+                            <input type="number" name="minimum_stock" value="` + minimum_stock + `" required
+                                style="width:100%;padding:0.625rem 0.75rem;border:1px solid #e2e8f0;border-radius:0.625rem;font-size:0.8rem;font-family:monospace;color:#1e293b;box-sizing:border-box;">
                         </div>
                     </div>
                     <div>
-                        <label style="display: block; font-size: 0.75rem; font-weight: 600; color: #64748b; text-transform: uppercase; margin-bottom: 0.25rem;">Current Stock Level</label>
-                        <input type="number" name="current_stock" value="` + current_stock + `" required style="width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #cbd5e1; border-radius: 0.375rem; font-size: 0.875rem; font-family: monospace; color: #1e293b;">
+                        <label style="display:block;font-size:0.65rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.25rem;">Current Stock Level</label>
+                        <input type="number" name="current_stock" value="` + current_stock + `" required
+                            style="width:100%;padding:0.625rem 0.75rem;border:1px solid #e2e8f0;border-radius:0.625rem;font-size:0.8rem;font-family:monospace;color:#1e293b;box-sizing:border-box;">
                     </div>
-                    <div style="display: flex; justify-content: flex-end; gap: 0.5rem; padding-top: 0.75rem; border-top: 1px solid #e2e8f0; margin-top: 0.5rem;">
-                        <button type="button" onclick="document.getElementById('dynamicEditItemModal').remove()" style="padding: 0.5rem 1rem; font-size: 0.75rem; font-weight: 700; color: #475569; background-color: #f1f5f9; border: none; border-radius: 0.375rem; cursor: pointer;">Cancel</button>
-                        <button type="submit" style="padding: 0.5rem 1rem; font-size: 0.75rem; font-weight: 700; color: white; background-color: #d97706; border: none; border-radius: 0.375rem; cursor: pointer;">Save Changes</button>
+                    <div style="display:flex;justify-content:flex-end;gap:0.5rem;padding-top:0.75rem;border-top:1px solid #f1f5f9;margin-top:0.25rem;">
+                        <button type="button" onclick="document.getElementById('dynamicEditItemModal').remove()"
+                            style="padding:0.5rem 1.125rem;font-size:0.7rem;font-weight:700;color:#475569;background:#f1f5f9;border:none;border-radius:0.5rem;cursor:pointer;">Cancel</button>
+                        <button type="submit"
+                            style="padding:0.5rem 1.125rem;font-size:0.7rem;font-weight:700;color:white;background:#d97706;border:none;border-radius:0.5rem;cursor:pointer;">&#10003; Save Changes</button>
                     </div>
                 </form>
             </div>
@@ -1209,7 +1536,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             </td>"""
 
         inventory_rows += f"""
-        <tr class="border-b border-slate-100 hover:bg-slate-50/50">
+        <tr class="border-b border-slate-100 hover:bg-slate-50/50" data-row="1">
             <td class="p-3 font-semibold text-slate-900">
                 <span>{it.name}</span>{alert_status}
                 <div class="text-[10px] text-slate-400 mt-0.5">
@@ -1219,8 +1546,8 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             </td>
             <td class="p-3 font-mono text-[11px] text-slate-500">{it.item_code}</td>
             {admin_only_cells}
-            <td class="p-3 font-mono font-bold text-slate-900">{it.current_stock}</td>
-            <td class="p-3 font-mono text-slate-400">{it.minimum_stock}</td>
+            <td class="p-3 font-mono font-bold text-slate-900" data-sort="{it.current_stock}">{it.current_stock}</td>
+            <td class="p-3 font-mono text-slate-400" data-sort="{it.minimum_stock}">{it.minimum_stock}</td>
             {action_cell}
         </tr>
         """
@@ -1365,15 +1692,15 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             </form>
         </div>"""
 
-        req_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs align-top">
+        req_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs align-top" data-row="1" data-text="{date_str} {r.requester.username if r.requester else ''} {r.status} {r.department or ''}">
             <td class="p-3 text-slate-500 font-mono whitespace-nowrap">{date_str}</td>
             <td class="p-3 text-slate-800">{item_desc_display}</td>
             <td class="p-3 font-mono font-semibold text-center">{r.quantity}</td>
-            <td class="p-3 font-mono text-slate-600 text-right whitespace-nowrap">{est_value_text}</td>
+            <td class="p-3 font-mono text-slate-600 text-right whitespace-nowrap" data-sort="{r.total_estimated_cost or 0}">{est_value_text}</td>
             <td class="p-3">{code_cell}</td>
             <td class="p-3">{spec_cell}</td>
             <td class="p-3 text-slate-500 whitespace-nowrap">{r.requester.username if r.requester else 'System'}</td>
-            <td class="p-3 text-center">{badge}</td>
+            <td class="p-3 text-center" data-status="{r.status}">{badge}</td>
             <td class="p-3">{msg_thread_cell}</td>
             <td class="p-3 text-right">{flow}</td>
         </tr>"""
@@ -1384,10 +1711,10 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         ts = a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "—"
         item_name = a.item.name if a.item else 'Archived Asset'
         dept = getattr(a, 'department', '—') or '—'
-        assigned_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs">
+        assigned_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs" data-row="1">
             <td class="p-3 font-mono text-slate-400 text-[11px]">{ts}</td>
             <td class="p-3 font-bold text-slate-800">{item_name}</td>
-            <td class="p-3 font-mono font-bold text-blue-700 text-center">{a.quantity}</td>
+            <td class="p-3 font-mono font-bold text-blue-700 text-center" data-sort="{a.quantity}">{a.quantity}</td>
             <td class="p-3 font-mono text-slate-500 text-center">{a.uom}</td>
             <td class="p-3 text-slate-700 font-medium">{a.issued_to}</td>
             <td class="p-3 text-slate-500">{dept}</td>
@@ -1443,6 +1770,9 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         <div class="bg-white p-6 rounded-xl border border-slate-200 shadow-xl mb-6">
             <div class="flex items-center justify-between border-b pb-2 mb-4">
                 <h2 class="text-xs font-black tracking-wider text-slate-500 uppercase">❖ Update Item Manually</h2>
+                <a href="/items/bulk-template" class="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-2.5 py-1.5 rounded-lg text-[10px] font-bold transition-all flex items-center gap-1 shadow-sm whitespace-nowrap">
+                    <i class="fa-solid fa-download"></i> Template
+                </a>
             </div>
             <form action="/items/add" method="POST" class="space-y-3 text-xs">
                 <div class="grid grid-cols-2 gap-3">
@@ -1541,7 +1871,6 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                                 .replace("__ADMIN_PANEL__", admin_panel)\
                                 .replace("__EMPLOYEE_CONTROL_PANEL__", employee_control_panel)\
                                 .replace("__USER_DIRECTORY_CONTROL_PANEL__", user_directory_control_panel)\
-                                .replace("__PROCUREMENT_WIDGET_PANEL__", templates.PROCUREMENT_WIDGET_PANEL)\
                                 .replace("__OPTIONS__", item_options)\
                                 .replace("__EMPLOYEE_OPTIONS__", employee_options)\
                                 .replace("__INVENTORY_ROWS__", inventory_rows)\
