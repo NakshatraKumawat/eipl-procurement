@@ -2,7 +2,7 @@ import datetime
 from sqlalchemy import Column, Integer, String, ForeignKey, Float, DateTime
 from sqlalchemy.orm import relationship
 from database import Base
-from sqlalchemy import Column, Integer, String, ForeignKey, Float, DateTime, Boolean
+from sqlalchemy import Column, Integer, String, ForeignKey, Float, DateTime, Boolean, LargeBinary
 
 class User(Base):
     __tablename__ = "users"
@@ -13,6 +13,25 @@ class User(Base):
     full_name = Column(String, default="EIPL Officer")
     designation = Column(String, default="Operations Specialist")
     workstation_location = Column(String, default="Corporate HQ")
+
+
+class ItemLot(Base):
+    """
+    Represents one (item, vendor, price) batch of stock.
+    The same item_code can have multiple lots from different vendors
+    or the same vendor at different prices over time. The sum of
+    `quantity` across all lots for an item equals `Item.current_stock`.
+    Outward transactions consume lots oldest-first (FIFO by received_at).
+    """
+    __tablename__ = "item_lots"
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.id"), index=True)
+    vendor = Column(String, default="Approved Vendor")
+    price = Column(Float, default=0.0)
+    quantity = Column(Integer, default=0)
+    received_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    item = relationship("Item")
 
 
 class Item(Base):
@@ -56,6 +75,10 @@ class ProcurementRequest(Base):
     new_item_name = Column(String, nullable=True)
     detailed_specification = Column(String, nullable=True)
 
+    # --- ADMIN-ENTERED PROCUREMENT PRICING (gates the Order button) ---
+    vendor = Column(String, nullable=True)        # Vendor chosen by admin before ordering
+    unit_price = Column(Float, nullable=True)      # Per-unit rate entered by admin before ordering
+
     item = relationship("Item")
     requester = relationship("User")
 
@@ -74,8 +97,13 @@ class MaterialAssignment(Base):
     custodian = Column(String, default="Common")                    # Tracks permanent allocation to individual users
     # --- MIS UPLOAD TRACKING ---
     mis_filename = Column(String, nullable=True)                    # Material Issue Slip file
+    mis_filedata = Column(LargeBinary, nullable=True)               # File bytes stored in shared DB (cross-device)
     mis_uploaded_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     mis_upload_timestamp = Column(DateTime, nullable=True)
+    # --- RETURN-TO-STORE TRACKING (same table; is_return flips direction) ---
+    is_return = Column(Boolean, default=False)                      # True for return-to-store rows
+    return_filename = Column(String, nullable=True)                 # Return-to-Store slip filename
+    return_filedata = Column(LargeBinary, nullable=True)            # Return-to-Store slip bytes (shared DB)
 
     item = relationship("Item")
     mis_uploader = relationship("User", foreign_keys=[mis_uploaded_by_id])
@@ -137,7 +165,12 @@ class GRNRecord(Base):
     quantity = Column(Integer)
     uom = Column(String, default="Nos")
     received_by = Column(String, nullable=True)
+    vendor = Column(String, nullable=True)            # Vendor for THIS inward batch (per-transaction, not catalog)
+    unit_price = Column(Float, nullable=True)          # Per-unit price for THIS inward batch
+    grn_no = Column(String, nullable=True)             # GRN reference number entered at inward
+    challan_no = Column(String, nullable=True)         # Challan / Invoice number entered at inward
     grn_filename = Column(String)
+    grn_filedata = Column(LargeBinary, nullable=True)  # File bytes stored in shared DB (cross-device)
     uploaded_by_id = Column(Integer, ForeignKey("users.id"))
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
 

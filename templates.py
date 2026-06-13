@@ -64,6 +64,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <style>
         body { font-family: 'Inter', sans-serif; }
         ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -88,25 +89,20 @@ LAYOUT_HTML = """<!DOCTYPE html>
         <nav class="flex-1 p-4 space-y-1 overflow-y-auto">
             <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2 font-semibold">Core Dashboard</p>
             
+            <button id="nav-requisitions" onclick="switchTab('requisitions')" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
+                <i class="fa-solid fa-file-invoice-dollar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Requisitions
+            </button>
+
             <a href="/material-movement" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
                 <i class="fa-solid fa-truck-ramp-box w-5 text-center text-slate-400 group-hover:text-emerald-600"></i> Material Movement
             </a>
 
-            <a href="/inventory/summary" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
-                <i class="fa-solid fa-chart-bar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Material Flow Dashboard
-            </a>
-
             <button id="nav-inventory" onclick="switchTab('inventory')" class="w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left">
-                <i class="fa-solid fa-boxes-stacked w-5 text-center text-indigo-600"></i> Inventory Configuration
-            </button>
-
-            
-            <button id="nav-requisitions" onclick="switchTab('requisitions')" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
-                <i class="fa-solid fa-file-invoice-dollar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Requisitions
+                <i class="fa-solid fa-boxes-stacked w-5 text-center text-indigo-600"></i> Inventory Configuration Log
             </button>
             
             <button id="nav-allocations" onclick="switchTab('allocations')" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
-                <i class="fa-solid fa-truck-ramp-box w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Allocations
+                <i class="fa-solid fa-list-check w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Allocation Log
             </button>
 
             <div class="pt-4 mt-4 border-t border-slate-100 space-y-1">
@@ -122,6 +118,12 @@ LAYOUT_HTML = """<!DOCTYPE html>
                 </a>
                 <a href="/mis/list" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-lg text-xs font-medium transition-all text-left group">
                     <i class="fa-solid fa-file-arrow-down w-4 text-center text-slate-400 group-hover:text-indigo-600"></i> MIS Download Centre
+                </a>
+                <a href="/rts/list" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-lg text-xs font-medium transition-all text-left group">
+                    <i class="fa-solid fa-arrow-rotate-left w-4 text-center text-slate-400 group-hover:text-amber-600"></i> RTS Download Centre
+                </a>
+                <a href="/account/password" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-lg text-xs font-medium transition-all text-left group">
+                    <i class="fa-solid fa-lock w-4 text-center text-slate-400 group-hover:text-indigo-600"></i> Change Password
                 </a>
             </div>
         </nav>
@@ -158,13 +160,13 @@ LAYOUT_HTML = """<!DOCTYPE html>
 
         <div class="flex-1 p-6 space-y-6 overflow-y-auto max-w-[1650px] w-full mx-auto">
             
-            <div id="tab-viewport-inventory" class="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
+            <div id="tab-viewport-inventory" class="grid grid-cols-1 xl:grid-cols-4 gap-6 items-start">
                 
                 <div class="xl:col-span-1 space-y-6">
                     __ADMIN_PANEL__
                 </div>
 
-                <div class="xl:col-span-2">
+                <div class="xl:col-span-3">
                     <div id="inventory-table-container" class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
                         <div class="p-5 border-b border-slate-100 bg-white flex flex-wrap items-center justify-between gap-3">
                             <div>
@@ -193,11 +195,12 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                     <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase border-b border-slate-200">
                                         <th class="p-4 pl-5 cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',0)">Item Name <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',1)">Item Code <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                        <th class="p-4 admin-only-col cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',2)">Vendor <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                        <th class="p-4 admin-only-col cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',3)">Price <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 admin-only-col text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',2)">Previous Vendor <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 admin-only-col text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',3)">Previous Price <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',4)">Current Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',5)">Safety Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 text-right pr-5">Actions</th>
+                                        <th class="p-4 text-center">Transaction Log</th>
                                     </tr>
                                 </thead>
                                 <tbody id="invTableBody" class="divide-y divide-slate-100 font-medium text-slate-700">
@@ -294,13 +297,18 @@ LAYOUT_HTML = """<!DOCTYPE html>
                             <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-6 p-2.5 rounded-xl font-bold tracking-wide transition-all shadow-md shadow-indigo-600/10 text-xs">
                                 Authorize Indent Workflow
                             </button>
-                            <span class="text-[10px] text-slate-400">or use Bulk Import →</span>
-                            <form action="/procurement/bulk-import" method="POST" enctype="multipart/form-data" class="flex gap-2 flex-1">
-                                <input type="file" name="file" accept=".csv" required class="flex-1 bg-slate-50 border border-slate-200 text-slate-600 text-[10px] p-2 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm">
-                                <button type="submit" class="bg-slate-700 hover:bg-slate-800 text-white px-3 py-2 rounded-xl font-bold text-[10px] tracking-wide transition-all shrink-0 shadow-sm">Import CSV</button>
-                            </form>
                         </div>
                     </form>
+
+                    <!-- Bulk CSV import is a SEPARATE form (must not be nested inside the indent form above —
+                         nested forms are invalid HTML and cause its 'required' file input to block single-item submits) -->
+                    <div class="flex items-center gap-3 mt-3 pt-3 border-t border-slate-100">
+                        <span class="text-[10px] text-slate-400">or use Bulk Import →</span>
+                        <form action="/procurement/bulk-import" method="POST" enctype="multipart/form-data" class="flex gap-2 flex-1">
+                            <input type="file" name="file" accept=".csv" required class="flex-1 bg-slate-50 border border-slate-200 text-slate-600 text-[10px] p-2 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm">
+                            <button type="submit" class="bg-slate-700 hover:bg-slate-800 text-white px-3 py-2 rounded-xl font-bold text-[10px] tracking-wide transition-all shrink-0 shadow-sm">Import CSV</button>
+                        </form>
+                    </div>
                 </div>
 
                 <!-- PROCUREMENT PIPELINE TABLE: full-width with search + pagination -->
@@ -312,6 +320,17 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                 <p class="text-[10px] text-slate-400 mt-0.5">Formal procurement intent registries and operations pipeline tracker</p>
                             </div>
                             <div class="flex flex-wrap items-center gap-2">
+                                <!-- Date range filter -->
+                                <div class="flex items-center gap-1">
+                                    <label class="text-[10px] font-bold text-slate-400 uppercase whitespace-nowrap">From:</label>
+                                    <input type="date" id="reqDateFrom" oninput="filterTable('req')"
+                                        class="bg-slate-50 border border-slate-200 text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-indigo-400">
+                                </div>
+                                <div class="flex items-center gap-1">
+                                    <label class="text-[10px] font-bold text-slate-400 uppercase whitespace-nowrap">To:</label>
+                                    <input type="date" id="reqDateTo" oninput="filterTable('req')"
+                                        class="bg-slate-50 border border-slate-200 text-xs px-2 py-1.5 rounded-lg focus:outline-none focus:border-indigo-400">
+                                </div>
                                 <!-- Search box -->
                                 <div class="relative">
                                     <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
@@ -331,6 +350,10 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                     <option value="50">50 / page</option>
                                     <option value="100">100 / page</option>
                                 </select>
+                                <!-- Export Excel -->
+                                <button onclick="exportProcurementExcel()" class="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shadow-sm">
+                                    <i class="fa-solid fa-file-excel"></i> Export
+                                </button>
                             </div>
                         </div>
                     </div>
@@ -470,6 +493,12 @@ LAYOUT_HTML = """<!DOCTYPE html>
     <script>
         // ---- GLOBAL DELEGATED EVENT HANDLER (safe data-* approach, no onclick string injection) ----
         document.addEventListener('click', function(e) {
+            var lotToggle = e.target.closest('.lot-toggle');
+            if (lotToggle) {
+                var row = document.getElementById(lotToggle.dataset.target);
+                if (row) row.classList.toggle('hidden');
+                return;
+            }
             var btn = e.target.closest('[data-action]');
             if (!btn) return;
             var action = btn.dataset.action;
@@ -477,8 +506,10 @@ LAYOUT_HTML = """<!DOCTYPE html>
 
             if (action === 'procure') {
                 openInwardFormForItem(d.id, d.name, d.code, d.price, d.uom, d.vendor);
+            } else if (action === 'create-indent') {
+                prefillIndentForItem(d.id, d.name, d.code, d.uom, d.dept);
             } else if (action === 'edit-item') {
-                openEditItemModal(d.id, d.name, d.code, d.price, d.stock, d.minstock);
+                openEditItemModal(d.id, d.name, d.code, d.price, d.stock, d.minstock, d.supplier, d.site);
             } else if (action === 'edit-request') {
                 openEditRequestModal(d.id, d.qty, d.dept, d.itemid);
             } else if (action === 'print-po') {
@@ -658,6 +689,21 @@ LAYOUT_HTML = """<!DOCTYPE html>
         // ---- END INWARD ITEM SEARCH ----
 
         // ---- PROC ITEM SEARCH ENGINE (Procurement Indent) ----
+        // Called when "Create Indent" is clicked on an inventory row — switches to the
+        // Requisitions tab and prefills the Create Procurement Indent form for that item.
+        function prefillIndentForItem(id, name, code, uom, dept) {
+            switchTab('requisitions');
+            setTimeout(function() {
+                selectProcItem(id, name, code, '');
+                var uomEl = document.querySelector('#tab-viewport-requisitions select[name="uom"]');
+                if (uomEl && uom) uomEl.value = uom;
+                var deptEl = document.querySelector('#tab-viewport-requisitions input[name="department"]');
+                if (deptEl && dept) deptEl.value = dept;
+                var form = document.querySelector('#tab-viewport-requisitions form[action="/procurement/request"]');
+                if (form) form.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }, 50);
+        }
+
         function filterProcItems(query) {
             var dropdown = document.getElementById('proc_item_dropdown');
             if (!dropdown) return;
@@ -744,6 +790,8 @@ LAYOUT_HTML = """<!DOCTYPE html>
             if (key === 'req') {
                 var sf = document.getElementById('reqStatusFilter');
                 st.extraFilter = sf ? sf.value.toLowerCase() : '';
+                st.dateFrom = (document.getElementById('reqDateFrom')||{}).value || '';
+                st.dateTo = (document.getElementById('reqDateTo')||{}).value || '';
             }
             st.page = 1;
             renderTable(key);
@@ -782,7 +830,22 @@ LAYOUT_HTML = """<!DOCTYPE html>
                     var statusCell = row.querySelector('td[data-status]');
                     matchExtra = statusCell ? statusCell.getAttribute('data-status').toLowerCase() === st.extraFilter : text.includes(st.extraFilter);
                 }
-                return matchSearch && matchExtra;
+                // Date range filter for req
+                var matchDate = true;
+                if (key === 'req' && (st.dateFrom || st.dateTo)) {
+                    var rowDate = row.getAttribute('data-date') || '';
+                    if (!rowDate) {
+                        // Try to extract from first cell (format: dd-mm-yyyy)
+                        var firstCell = row.querySelector('td');
+                        if (firstCell) {
+                            var parts = firstCell.textContent.trim().split(' ')[0].split('-');
+                            if (parts.length === 3) rowDate = parts[2] + '-' + parts[1] + '-' + parts[0];
+                        }
+                    }
+                    if (st.dateFrom && rowDate < st.dateFrom) matchDate = false;
+                    if (st.dateTo && rowDate > st.dateTo) matchDate = false;
+                }
+                return matchSearch && matchExtra && matchDate;
             });
 
             // Sort
@@ -840,6 +903,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
             var tbody = document.getElementById(bodyId);
             if (!tbody) return;
             tbody.querySelectorAll('tr').forEach(function(row) {
+                if (row.classList.contains('lot-detail-row')) return;
                 row.setAttribute('data-row', '1');
                 if (!row.getAttribute('data-text')) {
                     row.setAttribute('data-text', row.innerText.toLowerCase());
@@ -881,9 +945,9 @@ LAYOUT_HTML = """<!DOCTYPE html>
                 tagRows('reqTableBody'); renderTable('req');
             } else if (tabId === 'allocations') {
                 allocEl.classList.remove('hidden'); allocEl.classList.add('grid');
-                breadcrumb.innerText = "Physical Asset Allocations & Issue Logs";
+                breadcrumb.innerText = "Allocation Log";
                 activeNav.className = "w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left";
-                activeNav.querySelector('i').className = "fa-solid fa-truck-ramp-box w-5 text-center text-indigo-600";
+                activeNav.querySelector('i').className = "fa-solid fa-list-check w-5 text-center text-indigo-600";
                 tagRows('allocTableBody'); renderTable('alloc');
             }
 
@@ -918,7 +982,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
         function closeEditItemModal() { document.getElementById('editItemModal').style.display = 'none'; }
         function closeEditRequestModal() { document.getElementById('editRequestModal').style.display = 'none'; }
 
-        function openEditItemModal(id, name, code, price, stock, minStock) {
+        function openEditItemModal(id, name, code, price, stock, minStock, supplier, site) {
     var modalHtml = `
         <h3 class="text-xs font-bold uppercase text-slate-900 tracking-wider border-b border-slate-100 pb-3">&#9998; Modify Master Inventory Item</h3>
         <form action="/items/edit/${id}" method="POST" class="space-y-4 text-xs text-slate-700">
@@ -952,6 +1016,20 @@ LAYOUT_HTML = """<!DOCTYPE html>
                     <label class="block font-semibold text-slate-600 mb-1.5">Safety Min</label>
                     <input type="number" name="minimum_stock" value="${minStock}" required
                         class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl font-mono focus:outline-none focus:border-indigo-600 focus:bg-white">
+                </div>
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+                <div>
+                    <label class="block font-semibold text-slate-600 mb-1.5">Supplier / Vendor</label>
+                    <input type="text" name="supplier" value="${supplier||''}"
+                        class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white"
+                        placeholder="Vendor name">
+                </div>
+                <div>
+                    <label class="block font-semibold text-slate-600 mb-1.5">Storage Site</label>
+                    <input type="text" name="storage_site" value="${site||''}"
+                        class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white"
+                        placeholder="e.g. Store Yard">
                 </div>
             </div>
             <div class="flex gap-3 pt-2 border-t border-slate-100">
@@ -1131,12 +1209,238 @@ LAYOUT_HTML = """<!DOCTYPE html>
             link.click();
             document.body.removeChild(link);
         }
+
+        // =====================================================================
+        // PROCUREMENT PIPELINE EXCEL EXPORT (server-side, openpyxl)
+        // =====================================================================
+        function exportProcurementExcel() {
+            var from = (document.getElementById('reqDateFrom')||{}).value || '';
+            var to   = (document.getElementById('reqDateTo')||{}).value || '';
+            var url  = '/procurement/export-excel';
+            var params = [];
+            if (from) params.push('date_from=' + from);
+            if (to)   params.push('date_to=' + to);
+            if (params.length) url += '?' + params.join('&');
+            window.location.href = url;
+        }
+
+        // =====================================================================
+        // ADMIN DELETE PASSWORD PROTECTION MODAL
+        // Intercepts every form with class "delete-protected-form" and requires
+        // admin password verification before allowing the form to submit.
+        // =====================================================================
+        (function() {
+            // Create the modal DOM once
+            var modalHtml = `
+            <div id="adminDeleteModal" style="display:none;" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-[9999]">
+                <div class="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-sm mx-4 p-6">
+                    <div class="flex items-center gap-3 mb-4">
+                        <div class="w-10 h-10 rounded-xl bg-rose-100 flex items-center justify-center shrink-0">
+                            <i class="fa-solid fa-lock text-rose-600 text-sm"></i>
+                        </div>
+                        <div>
+                            <h3 class="text-sm font-black text-slate-900">Admin Authorisation Required</h3>
+                            <p class="text-[11px] text-slate-400 mt-0.5">Enter admin password to confirm deletion</p>
+                        </div>
+                    </div>
+                    <div class="bg-rose-50 border border-rose-200 rounded-xl p-3 mb-4">
+                        <p class="text-xs text-rose-700 font-semibold" id="adminDeleteTarget">This action is permanent and cannot be undone.</p>
+                    </div>
+                    <div class="mb-4">
+                        <label class="block text-xs font-bold text-slate-600 uppercase tracking-wider mb-1.5">Admin Password</label>
+                        <input type="password" id="adminDeletePassword" placeholder="Enter admin password..."
+                            class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-sm focus:outline-none focus:border-rose-500 focus:bg-white transition-all">
+                        <p id="adminDeleteError" class="text-[11px] text-rose-600 font-bold mt-1.5 hidden"></p>
+                    </div>
+                    <div class="flex gap-3">
+                        <button type="button" onclick="closeAdminDeleteModal()" class="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs p-2.5 rounded-xl border border-slate-200 transition-all">Cancel</button>
+                        <button type="button" id="adminDeleteConfirmBtn" onclick="confirmAdminDelete()" class="flex-1 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs p-2.5 rounded-xl transition-all">
+                            <i class="fa-solid fa-trash-can mr-1"></i> Confirm Delete
+                        </button>
+                    </div>
+                </div>
+            </div>`;
+            document.addEventListener('DOMContentLoaded', function() {
+                var wrapper = document.createElement('div');
+                wrapper.innerHTML = modalHtml;
+                document.body.appendChild(wrapper.firstElementChild);
+            });
+
+            var _pendingDeleteForm = null;
+
+            window.openAdminDeleteModal = function(form, label) {
+                _pendingDeleteForm = form;
+                document.getElementById('adminDeleteTarget').textContent = label || 'This action is permanent and cannot be undone.';
+                document.getElementById('adminDeletePassword').value = '';
+                document.getElementById('adminDeleteError').classList.add('hidden');
+                document.getElementById('adminDeleteModal').style.display = 'flex';
+                setTimeout(function(){ document.getElementById('adminDeletePassword').focus(); }, 100);
+            };
+
+            window.closeAdminDeleteModal = function() {
+                document.getElementById('adminDeleteModal').style.display = 'none';
+                _pendingDeleteForm = null;
+            };
+
+            window.confirmAdminDelete = function() {
+                var pw = document.getElementById('adminDeletePassword').value;
+                if (!pw) {
+                    document.getElementById('adminDeleteError').textContent = 'Password is required.';
+                    document.getElementById('adminDeleteError').classList.remove('hidden');
+                    return;
+                }
+                var btn = document.getElementById('adminDeleteConfirmBtn');
+                btn.textContent = 'Verifying…';
+                btn.disabled = true;
+
+                var fd = new FormData();
+                fd.append('password', pw);
+                fetch('/admin/verify-password', { method: 'POST', body: fd })
+                .then(function(r){ return r.json().then(function(d){ return {ok: r.ok, data: d}; }); })
+                .then(function(res) {
+                    if (res.ok && res.data.ok) {
+                        // Password correct — submit the pending form
+                        closeAdminDeleteModal();
+                        if (_pendingDeleteForm) _pendingDeleteForm.submit();
+                    } else {
+                        document.getElementById('adminDeleteError').textContent = res.data.msg || 'Incorrect password. Access denied.';
+                        document.getElementById('adminDeleteError').classList.remove('hidden');
+                        btn.textContent = 'Confirm Delete';
+                        btn.disabled = false;
+                    }
+                })
+                .catch(function() {
+                    document.getElementById('adminDeleteError').textContent = 'Server error. Try again.';
+                    document.getElementById('adminDeleteError').classList.remove('hidden');
+                    btn.textContent = 'Confirm Delete';
+                    btn.disabled = false;
+                });
+            };
+
+            // Enter key handler for password field
+            document.addEventListener('DOMContentLoaded', function() {
+                document.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter' && document.getElementById('adminDeleteModal') &&
+                        document.getElementById('adminDeleteModal').style.display !== 'none') {
+                        confirmAdminDelete();
+                    }
+                });
+            });
+        })();
+    </script>
+
+    <!-- ===== Merged Transaction Log Modal (from Material Flow Dashboard) ===== -->
+    <div id="txnModal" style="display:none;" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm items-center justify-center z-[999] flex">
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-3xl mx-4 flex flex-col max-h-[80vh]">
+            <div class="flex items-center justify-between p-5 border-b border-slate-100">
+                <div>
+                    <h3 class="text-sm font-black text-slate-900" id="txnModalTitle">Transaction Log</h3>
+                    <p class="text-[10px] text-slate-400 mt-0.5" id="txnModalSubtitle"></p>
+                </div>
+                <button onclick="closeTxnLog()" class="text-slate-400 hover:text-slate-700 p-1.5 rounded-lg hover:bg-slate-100 transition-all">
+                    <i class="fa-solid fa-xmark text-sm"></i>
+                </button>
+            </div>
+            <div class="overflow-y-auto flex-1">
+                <table class="w-full text-left border-collapse text-xs">
+                    <thead class="sticky top-0">
+                        <tr class="bg-slate-50 text-slate-500 font-semibold uppercase tracking-wider border-b border-slate-200">
+                            <th class="px-4 py-3">Date</th>
+                            <th class="px-4 py-3">Type</th>
+                            <th class="px-4 py-3 text-center">Quantity</th>
+                            <th class="px-4 py-3">UOM</th>
+                            <th class="px-4 py-3">Person</th>
+                            <th class="px-4 py-3">GRN No.</th>
+                            <th class="px-4 py-3">Challan / Invoice No.</th>
+                            <th class="px-4 py-3 txn-admin-col">Vendor</th>
+                            <th class="px-4 py-3 txn-admin-col">Rate &#8377;</th>
+                            <th class="px-4 py-3 txn-admin-col">Price Diff</th>
+                            <th class="px-4 py-3 txn-admin-col">Percentage Diff</th>
+                        </tr>
+                    </thead>
+                    <tbody id="txnLogBody"></tbody>
+                </table>
+            </div>
+            <div class="p-4 border-t border-slate-100 flex justify-end">
+                <button onclick="closeTxnLog()" class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-4 py-2 rounded-xl transition-all">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        var TXN_IS_ADMIN = __IS_ADMIN__;
+        (function(){
+            if (!TXN_IS_ADMIN) {
+                document.querySelectorAll('.txn-admin-col').forEach(function(el){ el.style.display='none'; });
+            }
+        })();
+
+        function openTxnLog(itemId, name, code) {
+            document.getElementById('txnModalTitle').textContent = name + ' \u2014 Transaction Log';
+            document.getElementById('txnModalSubtitle').textContent = 'Code: ' + code;
+            var data = (window.__txnData && window.__txnData[itemId]) || [];
+            var tbody = document.getElementById('txnLogBody');
+            var colSpan = TXN_IS_ADMIN ? 11 : 7;
+            if (!data.length) {
+                tbody.innerHTML = '<tr><td colspan="' + colSpan + '" class="px-4 py-6 text-center text-slate-400">No transactions found.</td></tr>';
+            } else {
+                tbody.innerHTML = data.map(function(tx) {
+                    var isReturn = (tx.type === 'RETURN');
+                    var color;
+                    if (isReturn) {
+                        color = 'bg-amber-100 text-amber-700';
+                    } else {
+                        color = tx.direction === 'IN' ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700';
+                    }
+                    var label;
+                    if (isReturn) {
+                        label = 'Returned by: ';
+                    } else {
+                        label = tx.direction === 'IN' ? 'Received by: ' : 'Issued to: ';
+                    }
+                    // GRN / Challan only meaningful for true purchase inwards
+                    var grnNo = (tx.direction === 'IN' && !isReturn) ? (tx.grn_no || '\u2014') : '\u2014';
+                    var challanNo = (tx.direction === 'IN' && !isReturn) ? (tx.challan_no || '\u2014') : '\u2014';
+                    var adminCols = '';
+                    if (TXN_IS_ADMIN && tx.direction === 'IN' && !isReturn) {
+                        var priceStr = tx.price != null ? '\u20b9' + Number(tx.price).toFixed(2) : '\u2014';
+                        var diffStr = '\u2014', diffClass = '', pctStr = '\u2014';
+                        if (tx.price_diff != null && tx.price_diff !== 0) {
+                            var sign = tx.price_diff > 0 ? '+' : '';
+                            diffStr = sign + '\u20b9' + Number(tx.price_diff).toFixed(2);
+                            diffClass = tx.price_diff > 0 ? 'text-rose-600 font-bold' : 'text-emerald-600 font-bold';
+                            if (tx.pct_diff != null) { pctStr = sign + Number(tx.pct_diff).toFixed(2) + '%'; }
+                        }
+                        adminCols = '<td class="px-4 py-2.5 text-slate-500 text-[11px]">' + (tx.vendor || '\u2014') + '</td>' +
+                            '<td class="px-4 py-2.5 font-mono text-slate-700">' + priceStr + '</td>' +
+                            '<td class="px-4 py-2.5 font-mono ' + diffClass + '">' + diffStr + '</td>' +
+                            '<td class="px-4 py-2.5 font-mono ' + diffClass + '">' + pctStr + '</td>';
+                    } else if (TXN_IS_ADMIN) {
+                        adminCols = '<td class="px-4 py-2.5 text-slate-300">\u2014</td><td class="px-4 py-2.5 text-slate-300">\u2014</td><td class="px-4 py-2.5 text-slate-300">\u2014</td><td class="px-4 py-2.5 text-slate-300">\u2014</td>';
+                    }
+                    return '<tr class="border-b border-slate-100 hover:bg-slate-50">' +
+                        '<td class="px-4 py-2.5 font-mono text-slate-400 text-[11px]">' + tx.date + '</td>' +
+                        '<td class="px-4 py-2.5"><span class="font-bold px-2 py-0.5 rounded text-[11px] ' + color + '">' + tx.type + '</span></td>' +
+                        '<td class="px-4 py-2.5 font-mono font-bold text-center">' + tx.qty + '</td>' +
+                        '<td class="px-4 py-2.5 text-slate-500">' + tx.uom + '</td>' +
+                        '<td class="px-4 py-2.5 text-slate-600 text-[11px]">' + label + '<b>' + tx.person + '</b></td>' +
+                        '<td class="px-4 py-2.5 font-mono text-slate-600 text-[11px]">' + grnNo + '</td>' +
+                        '<td class="px-4 py-2.5 font-mono text-slate-600 text-[11px]">' + challanNo + '</td>' +
+                        adminCols +
+                    '</tr>';
+                }).join('');
+            }
+            document.getElementById('txnModal').style.display = 'flex';
+        }
+        function closeTxnLog() {
+            document.getElementById('txnModal').style.display = 'none';
+        }
+        document.getElementById('txnModal').addEventListener('click', function(e) {
+            if (e.target === this) closeTxnLog();
+        });
     </script>
 </body>
 </html>"""
-
-
-# =========================================================================
 # Place this at the very bottom of templates.py
 # =========================================================================
 

@@ -18,6 +18,9 @@ from datetime import datetime
 
 # ============================================================
 # STEP 1 — PASTE YOUR SUPABASE CONNECTION STRING HERE
+# ⚠️  SECURITY WARNING: Never commit this file to version control
+#     (git, GitHub, etc.) with a real password filled in.
+#     After migration, delete this file or blank out the password.
 # ============================================================
 SUPABASE_URL = "postgresql://postgres.wmkvpcoctuimuimujocz:Eipl1234Inventory@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres"
 
@@ -72,7 +75,7 @@ def migrate():
             print(f"✅ users          — {len(users)} rows migrated")
         
         # Reset sequence so new users don't conflict
-        pc.execute("SELECT setval('users_id_seq', (SELECT MAX(id) FROM users))")
+        pc.execute("SELECT setval('users_id_seq', COALESCE((SELECT MAX(id) FROM users), 1))")
 
         # ------------------------------------------------
         # 2. ITEMS
@@ -88,7 +91,7 @@ def migrate():
                    i['supplier'], i['storage_site'], i['price'], i['current_stock'], i['minimum_stock']) for i in items])
             print(f"✅ items           — {len(items)} rows migrated")
         
-        pc.execute("SELECT setval('items_id_seq', (SELECT MAX(id) FROM items))")
+        pc.execute("SELECT setval('items_id_seq', COALESCE((SELECT MAX(id) FROM items), 1))")
 
         # ------------------------------------------------
         # 3. EMPLOYEES
@@ -103,7 +106,7 @@ def migrate():
             """, [(e['id'], e['name'], e['role_title'], e['location'], e['contact']) for e in employees])
             print(f"✅ employees       — {len(employees)} rows migrated")
         
-        pc.execute("SELECT setval('employees_id_seq', (SELECT MAX(id) FROM employees))")
+        pc.execute("SELECT setval('employees_id_seq', COALESCE((SELECT MAX(id) FROM employees), 1))")
 
         # ------------------------------------------------
         # 4. PROCUREMENT REQUESTS
@@ -120,7 +123,7 @@ def migrate():
                    bool(p['is_new_item']), p['new_item_name'], p['detailed_specification']) for p in preqs])
             print(f"✅ procurement_requests — {len(preqs)} rows migrated")
         
-        pc.execute("SELECT setval('procurement_requests_id_seq', (SELECT MAX(id) FROM procurement_requests))")
+        pc.execute("SELECT setval('procurement_requests_id_seq', COALESCE((SELECT MAX(id) FROM procurement_requests), 1))")
 
         # ------------------------------------------------
         # 5. MATERIAL ASSIGNMENTS
@@ -138,7 +141,7 @@ def migrate():
                    ts(m['mis_upload_timestamp'])) for m in massigns])
             print(f"✅ material_assignments — {len(massigns)} rows migrated")
         
-        pc.execute("SELECT setval('material_assignments_id_seq', (SELECT MAX(id) FROM material_assignments))")
+        pc.execute("SELECT setval('material_assignments_id_seq', COALESCE((SELECT MAX(id) FROM material_assignments), 1))")
 
         # ------------------------------------------------
         # 6. TRANSACTIONS
@@ -154,7 +157,7 @@ def migrate():
                    t['total_value'], t['user_id'], ts(t['timestamp'])) for t in txns])
             print(f"✅ transactions    — {len(txns)} rows migrated")
         
-        pc.execute("SELECT setval('transactions_id_seq', (SELECT MAX(id) FROM transactions))")
+        pc.execute("SELECT setval('transactions_id_seq', COALESCE((SELECT MAX(id) FROM transactions), 1))")
 
         # ------------------------------------------------
         # 7. MATERIAL REQUESTS
@@ -172,7 +175,7 @@ def migrate():
                    m['new_item_name'], m['detailed_specification']) for m in mreqs])
             print(f"✅ material_requests — {len(mreqs)} rows migrated")
         
-        pc.execute("SELECT setval('material_requests_id_seq', (SELECT MAX(id) FROM material_requests))")
+        pc.execute("SELECT setval('material_requests_id_seq', COALESCE((SELECT MAX(id) FROM material_requests), 1))")
 
         # ------------------------------------------------
         # 8. GRN RECORDS
@@ -188,7 +191,7 @@ def migrate():
                    g['grn_filename'], g['uploaded_by_id'], ts(g['timestamp'])) for g in grns])
             print(f"✅ grn_records     — {len(grns)} rows migrated")
         
-        pc.execute("SELECT setval('grn_records_id_seq', (SELECT MAX(id) FROM grn_records))")
+        pc.execute("SELECT setval('grn_records_id_seq', COALESCE((SELECT MAX(id) FROM grn_records), 1))")
 
         # ------------------------------------------------
         # COMMIT ALL

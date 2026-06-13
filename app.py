@@ -16,6 +16,210 @@ from database import engine, get_db, SessionLocal
 # Force absolute structural table synchronization on startup
 models.Base.metadata.create_all(bind=engine)
 
+# -------------------------------------------------------------
+# MULTI-VENDOR LOT / FIFO HELPERS
+# -------------------------------------------------------------
+# Each Item can have multiple ItemLot rows — one per (vendor, price)
+# combination. Item.current_stock is kept as a cached running total
+# equal to the sum of all of that item's lot quantities, so existing
+# code that reads current_stock for display/low-stock checks keeps
+# working unchanged.
+
+_LOT_PRICE_EPS = 0.005  # treat prices within half a paisa as the same lot
+
+
+def add_to_lot(db: Session, item: "models.Item", vendor: str, price: float, quantity: int, received_at=None):
+    """Add `quantity` units to the matching (item, vendor, price) lot,
+    creating it if it doesn't exist yet. Also bumps item.current_stock."""
+    import datetime as _dt
+    if quantity <= 0:
+        return
+    vendor = (vendor or item.supplier or "Approved Vendor").strip() or "Approved Vendor"
+    price = float(price) if price is not None else 0.0
+
+    lot = db.query(models.ItemLot).filter(
+        models.ItemLot.item_id == item.id,
+        models.ItemLot.vendor == vendor,
+        models.ItemLot.price.between(price - _LOT_PRICE_EPS, price + _LOT_PRICE_EPS)
+    ).first()
+
+    if lot:
+        lot.quantity += quantity
+    else:
+        db.add(models.ItemLot(
+            item_id=item.id, vendor=vendor, price=price,
+            quantity=quantity, received_at=received_at or _dt.datetime.utcnow()
+        ))
+
+    item.current_stock = (item.current_stock or 0) + quantity
+
+
+def consume_fifo(db: Session, item: "models.Item", quantity: int):
+    """Consume `quantity` units from this item's lots, oldest first.
+    Returns the total cost (sum of qty_taken * lot.price) of the units
+    consumed. Reduces item.current_stock accordingly. Caller is
+    responsible for checking sufficient stock beforehand; if lots run
+    out early, the remainder is costed at the item's current `price`."""
+    remaining = quantity
+    total_cost = 0.0
+
+    lots = db.query(models.ItemLot).filter(
+        models.ItemLot.item_id == item.id,
+        models.ItemLot.quantity > 0
+    ).order_by(models.ItemLot.received_at.asc(), models.ItemLot.id.asc()).all()
+
+    for lot in lots:
+        if remaining <= 0:
+            break
+        take = min(lot.quantity, remaining)
+        if take > 0:
+            lot.quantity -= take
+            total_cost += take * (lot.price or 0.0)
+            remaining -= take
+
+    if remaining > 0:
+        # Lots didn't cover the full quantity (e.g. legacy stock with no
+        # lot records yet) — cost the shortfall at the item's list price.
+        total_cost += remaining * (item.price or 0.0)
+        remaining = 0
+
+    item.current_stock = max(0, (item.current_stock or 0) - quantity)
+    return total_cost
+
+
+def reconcile_stock_delta(db: Session, item: "models.Item", delta: int):
+    """Apply a manual stock adjustment (e.g. from the Edit Item modal) of
+    `delta` units (positive or negative) to the lot ledger, keeping
+    sum(lot.quantity) == item.current_stock."""
+    if delta == 0:
+        return
+    if delta > 0:
+        add_to_lot(db, item, "Manual Adjustment", item.price or 0.0, delta)
+    else:
+        consume_fifo(db, item, -delta)
+
+
+def build_txn_logs(db: Session, items):
+    """Build per-item transaction logs used by both the Material Flow view
+    and the merged Inventory Configuration table.
+
+    Each inward (IN) row carries its OWN vendor and per-unit price taken
+    from its GRN record (not the item's moving catalog value), so a later
+    inward at a different vendor/price no longer rewrites historical rows.
+
+    Price Diff / Percentage Diff are computed batch-over-batch: each IN is
+    compared to the immediately preceding IN of the same item, so they show
+    how the newly entered price changed versus the previous purchase.
+    Returns {item_id: [entry, ...]} sorted newest-first.
+    """
+    import datetime as _dt
+    transactions = db.query(models.Transaction).all()
+    assignments = db.query(models.MaterialAssignment).all()
+    grns = db.query(models.GRNRecord).all()
+    item_by_id = {i.id: i for i in items}
+    _MIN = _dt.datetime.min
+
+    # Legacy fallback: per-unit price by (item_id, minute) from IN transactions
+    txn_price_lookup = {}
+    for t in transactions:
+        if t.type == "IN" and t.quantity and t.quantity > 0 and t.total_value:
+            per_unit = round(t.total_value / t.quantity, 2)
+            ts_str = t.timestamp.strftime("%d-%m-%Y %H:%M") if t.timestamp else ""
+            txn_price_lookup.setdefault(t.item_id, {})[ts_str] = per_unit
+
+    # Vendor recovery for legacy GRNs (no stored vendor): the actual vendor
+    # for each batch was recorded in item_lots at inward time. We match a GRN
+    # to its lot by price so old rows show their ORIGINAL vendor instead of
+    # the item's current catalog supplier. Include consumed (qty 0) lots too,
+    # since they still hold the vendor history.
+    lots_by_item = {}
+    for lot in db.query(models.ItemLot).all():
+        lots_by_item.setdefault(lot.item_id, []).append(lot)
+
+    def _recover_vendor(item_id, unit_price, when, fallback):
+        lots = lots_by_item.get(item_id)
+        if not lots:
+            return fallback
+        # candidates whose price matches this batch's per-unit price
+        cands = [l for l in lots if abs((l.price or 0.0) - (unit_price or 0.0)) <= 0.01]
+        if not cands:
+            return fallback
+        # prefer the lot that existed by this GRN's time, closest in time
+        prior = [l for l in cands if (l.received_at or _MIN) <= (when or _MIN)]
+        pool = prior if prior else cands
+        best = min(pool, key=lambda l: abs(((l.received_at or _MIN) - (when or _MIN)).total_seconds()))
+        return best.vendor or fallback
+
+    # IN entries from GRNs (keep real datetime for correct chronological sort)
+    in_entries = {}
+    for g in grns:
+        item_obj = item_by_id.get(g.item_id)
+        catalog_price = (item_obj.price if item_obj else 0.0) or 0.0
+        catalog_vendor = (item_obj.supplier if item_obj else "\u2014") or "\u2014"
+        gdt = g.timestamp or _MIN
+        grn_date = g.timestamp.strftime("%d-%m-%Y %H:%M") if g.timestamp else ""
+        unit_price = getattr(g, "unit_price", None)
+        if unit_price is None:
+            unit_price = txn_price_lookup.get(g.item_id, {}).get(grn_date, catalog_price)
+        # Use the GRN's own stored vendor; for legacy rows, recover it from the
+        # matching lot by price, and only then fall back to the catalog vendor.
+        vendor = getattr(g, "vendor", None)
+        if not vendor:
+            vendor = _recover_vendor(g.item_id, unit_price, gdt, catalog_vendor)
+        person = getattr(g, "received_by", "") or (g.uploader.username if g.uploader else "\u2014")
+        entry = {
+            "date": grn_date, "type": "IN", "qty": g.quantity,
+            "uom": g.uom or "Nos", "person": person or "\u2014", "direction": "IN",
+            "vendor": vendor, "price": round(unit_price or 0.0, 2),
+            "grn_no": getattr(g, "grn_no", None) or "\u2014",
+            "challan_no": getattr(g, "challan_no", None) or "\u2014",
+            "price_diff": None, "pct_diff": None,
+        }
+        in_entries.setdefault(g.item_id, []).append((gdt, entry))
+
+    # Compute batch-over-batch diffs per item
+    for lst in in_entries.values():
+        lst.sort(key=lambda x: x[0])  # oldest first
+        prev_price = None
+        for _dtk, e in lst:
+            if prev_price is not None and prev_price > 0:
+                diff = round(e["price"] - prev_price, 2)
+                if abs(diff) > 0.01:
+                    e["price_diff"] = diff
+                    e["pct_diff"] = round((diff / prev_price) * 100, 2)
+            prev_price = e["price"]
+
+    # OUT entries from material assignments
+    # OUT entries (issues) and RETURN entries from material_assignments
+    out_entries = {}
+    for a in assignments:
+        adt = a.timestamp or _MIN
+        is_ret = bool(getattr(a, "is_return", False))
+        if is_ret:
+            # A return puts stock back. Show as IN-direction but flagged "RETURN"
+            # so the modal doesn't render vendor/price/GRN data for it.
+            entry = {
+                "date": a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "",
+                "type": "RETURN", "qty": a.quantity, "uom": a.uom or "Nos",
+                "person": a.issued_to or "\u2014", "direction": "IN",
+                "is_return": True,
+            }
+        else:
+            entry = {
+                "date": a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "",
+                "type": "OUT", "qty": a.quantity, "uom": a.uom or "Nos",
+                "person": a.issued_to or "\u2014", "direction": "OUT",
+            }
+        out_entries.setdefault(a.item_id, []).append((adt, entry))
+
+    logs = {}
+    for iid in set(in_entries) | set(out_entries):
+        combined = in_entries.get(iid, []) + out_entries.get(iid, [])
+        combined.sort(key=lambda x: x[0], reverse=True)  # newest first
+        logs[iid] = [e for _dtk, e in combined]
+    return logs
+
+
 app = FastAPI(title="EIPL Enterprise Procurement Framework")
 
 # Serve static assets (company logo etc.) from ./static folder
@@ -57,63 +261,127 @@ def run_structural_database_migrations():
     existing_cols_items = []
 
     try:
-        with engine.connect() as conn:
-            existing_cols_emp   = [col['name'] for col in engine.dialect.get_columns(conn, "employees")]
-            existing_cols_proc  = [col['name'] for col in engine.dialect.get_columns(conn, "procurement_requests")]
-            existing_cols_ma    = [col['name'] for col in engine.dialect.get_columns(conn, "material_assignments")]
-            existing_cols_items = [col['name'] for col in engine.dialect.get_columns(conn, "items")]
+        from sqlalchemy import inspect as _inspect
+        _insp = _inspect(engine)
+        existing_cols_emp   = [col['name'] for col in _insp.get_columns('employees')]
+        existing_cols_proc  = [col['name'] for col in _insp.get_columns('procurement_requests')]
+        existing_cols_ma    = [col['name'] for col in _insp.get_columns('material_assignments')]
+        existing_cols_items = [col['name'] for col in _insp.get_columns('items')]
     except Exception as e:
         print(f"[Migration] Schema inspection error: {e}")
 
     # --- Phase 2: Apply any missing ALTER TABLE statements ---
-    db = SessionLocal()
     try:
-        if "location" not in existing_cols_emp:
-            db.execute(text("ALTER TABLE employees ADD COLUMN location TEXT DEFAULT 'Not Specified'"))
-        if "contact" not in existing_cols_emp:
-            db.execute(text("ALTER TABLE employees ADD COLUMN contact TEXT DEFAULT 'Not Specified'"))
-        if "department" not in existing_cols_proc:
-            db.execute(text("ALTER TABLE procurement_requests ADD COLUMN department TEXT DEFAULT 'Operations'"))
-        if "department" not in existing_cols_ma:
-            db.execute(text("ALTER TABLE material_assignments ADD COLUMN department TEXT DEFAULT 'General Operations'"))
-        if "mis_filename" not in existing_cols_ma:
-            db.execute(text("ALTER TABLE material_assignments ADD COLUMN mis_filename TEXT"))
-        if "mis_uploaded_by_id" not in existing_cols_ma:
-            db.execute(text("ALTER TABLE material_assignments ADD COLUMN mis_uploaded_by_id INTEGER"))
-        if "mis_upload_timestamp" not in existing_cols_ma:
-            db.execute(text("ALTER TABLE material_assignments ADD COLUMN mis_upload_timestamp DATETIME"))
-
-        # Add uom column to items if missing (locked once first transaction is recorded)
-        if "uom" not in existing_cols_items:
-            db.execute(text("ALTER TABLE items ADD COLUMN uom TEXT"))
-
-        db.commit()
+        with engine.connect() as _conn:
+            if "location" not in existing_cols_emp:
+                _conn.execute(text("ALTER TABLE employees ADD COLUMN location TEXT DEFAULT 'Not Specified'"))
+            if "contact" not in existing_cols_emp:
+                _conn.execute(text("ALTER TABLE employees ADD COLUMN contact TEXT DEFAULT 'Not Specified'"))
+            if "department" not in existing_cols_proc:
+                _conn.execute(text("ALTER TABLE procurement_requests ADD COLUMN department TEXT DEFAULT 'Operations'"))
+            if "department" not in existing_cols_ma:
+                _conn.execute(text("ALTER TABLE material_assignments ADD COLUMN department TEXT DEFAULT 'General Operations'"))
+            if "mis_filename" not in existing_cols_ma:
+                _conn.execute(text("ALTER TABLE material_assignments ADD COLUMN mis_filename TEXT"))
+            if "mis_uploaded_by_id" not in existing_cols_ma:
+                _conn.execute(text("ALTER TABLE material_assignments ADD COLUMN mis_uploaded_by_id INTEGER"))
+            if "mis_upload_timestamp" not in existing_cols_ma:
+                _conn.execute(text("ALTER TABLE material_assignments ADD COLUMN mis_upload_timestamp DATETIME"))
+            if "uom" not in existing_cols_items:
+                _conn.execute(text("ALTER TABLE items ADD COLUMN uom TEXT"))
+            _conn.commit()
     except Exception as e:
-        db.rollback()
         print(f"[Migration Adaptive Notice] Columns pre-aligned: {e}")
-    finally:
-        db.close()
 
     # Ensure procurement_messages table exists (new feature)
+    # Uses engine directly so DDL works on both SQLite and PostgreSQL
     try:
-        db2 = SessionLocal()
-        db2.execute(text("""
-            CREATE TABLE IF NOT EXISTS procurement_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                request_id INTEGER REFERENCES procurement_requests(id),
-                sender_id INTEGER REFERENCES users(id),
-                message TEXT,
-                timestamp DATETIME
-            )
-        """))
-        db2.commit()
-        # Add received_by to grn_records if missing
-        try:
-            db2.execute(text("ALTER TABLE grn_records ADD COLUMN received_by TEXT"))
-            db2.commit()
-        except Exception:
-            pass
-        db2.close()
+        with engine.connect() as _ddl_conn:
+            if engine.dialect.name == "postgresql":
+                _ddl_conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS procurement_messages (
+                        id SERIAL PRIMARY KEY,
+                        request_id INTEGER REFERENCES procurement_requests(id),
+                        sender_id INTEGER REFERENCES users(id),
+                        message TEXT,
+                        timestamp TIMESTAMP
+                    )
+                """))
+            else:
+                _ddl_conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS procurement_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        request_id INTEGER REFERENCES procurement_requests(id),
+                        sender_id INTEGER REFERENCES users(id),
+                        message TEXT,
+                        timestamp DATETIME
+                    )
+                """))
+            # Add received_by to grn_records if missing
+            try:
+                _ddl_conn.execute(text("ALTER TABLE grn_records ADD COLUMN received_by TEXT"))
+            except Exception:
+                pass  # Column already exists
+            # Per-batch vendor + price so the transaction log keeps each
+            # inward's own vendor/price instead of the moving catalog value
+            try:
+                _ddl_conn.execute(text("ALTER TABLE grn_records ADD COLUMN vendor TEXT"))
+            except Exception:
+                pass
+            try:
+                _ddl_conn.execute(text("ALTER TABLE grn_records ADD COLUMN unit_price DOUBLE PRECISION"
+                                       if engine.dialect.name == "postgresql"
+                                       else "ALTER TABLE grn_records ADD COLUMN unit_price REAL"))
+            except Exception:
+                pass
+            # GRN / Challan reference numbers captured at inward time
+            try:
+                _ddl_conn.execute(text("ALTER TABLE grn_records ADD COLUMN grn_no TEXT"))
+            except Exception:
+                pass
+            try:
+                _ddl_conn.execute(text("ALTER TABLE grn_records ADD COLUMN challan_no TEXT"))
+            except Exception:
+                pass
+            # Admin-entered procurement pricing (vendor + rate) that gates ordering
+            try:
+                _ddl_conn.execute(text("ALTER TABLE procurement_requests ADD COLUMN vendor TEXT"))
+            except Exception:
+                pass
+            try:
+                _ddl_conn.execute(text("ALTER TABLE procurement_requests ADD COLUMN unit_price DOUBLE PRECISION"
+                                       if engine.dialect.name == "postgresql"
+                                       else "ALTER TABLE procurement_requests ADD COLUMN unit_price REAL"))
+            except Exception:
+                pass
+
+            # --- Store uploaded file bytes in the shared DB so they are
+            #     available across all devices (local disk is per-machine
+            #     and ephemeral on Render). BYTEA on Postgres, BLOB on SQLite. ---
+            _blob_type = "BYTEA" if engine.dialect.name == "postgresql" else "BLOB"
+            try:
+                _ddl_conn.execute(text(f"ALTER TABLE grn_records ADD COLUMN grn_filedata {_blob_type}"))
+            except Exception:
+                pass  # Column already exists
+            try:
+                _ddl_conn.execute(text(f"ALTER TABLE material_assignments ADD COLUMN mis_filedata {_blob_type}"))
+            except Exception:
+                pass  # Column already exists
+            # --- Return-to-Store columns on material_assignments (same table) ---
+            _bool_default = "BOOLEAN DEFAULT FALSE" if engine.dialect.name == "postgresql" else "BOOLEAN DEFAULT 0"
+            try:
+                _ddl_conn.execute(text(f"ALTER TABLE material_assignments ADD COLUMN is_return {_bool_default}"))
+            except Exception:
+                pass
+            try:
+                _ddl_conn.execute(text("ALTER TABLE material_assignments ADD COLUMN return_filename TEXT"))
+            except Exception:
+                pass
+            try:
+                _ddl_conn.execute(text(f"ALTER TABLE material_assignments ADD COLUMN return_filedata {_blob_type}"))
+            except Exception:
+                pass
+            _ddl_conn.commit()
     except Exception as e:
         print(f"[Migration] procurement_messages: {e}")
 
@@ -191,11 +459,11 @@ def do_logout():
 
 @app.post("/transaction")
 async def create_transaction(
-    item_id: str = Form(...),              # "NEW" or existing item id
+    item_id: str = Form(...),              # "NEW_INWARD_ITEM" or existing item id
     quantity: int = Form(...),
     uom: str = Form(...),
-    vendor: str = Form(None),
-    price: float = Form(None),
+    grn_no: str = Form(None),
+    challan_no: str = Form(None),
     new_item_name: str = Form(None),
     new_item_code: str = Form(None),
     site: str = Form(None),
@@ -215,21 +483,22 @@ async def create_transaction(
     os.makedirs(grn_dir, exist_ok=True)
     timestamp_str = _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
+    placed_orders = []  # procurement orders this receipt fulfils
+
     if item_id == "NEW_INWARD_ITEM":
-        # --- NEW ITEM PATH ---
+        # --- NEW ITEM PATH (ad-hoc receipt; vendor/price come later via procurement) ---
         if not new_item_name or not new_item_code:
             return HTMLResponse("<script>alert('Item Name and Item Code are required for a new item.'); window.history.back();</script>")
         clean_code = new_item_code.strip().upper()
-        # Check uniqueness
         existing = db.query(models.Item).filter(models.Item.item_code == clean_code).first()
         if existing:
             return HTMLResponse(f"<script>alert('Item Code {clean_code} already exists in catalog. Please use Search & Select for existing items.'); window.history.back();</script>")
         new_item = models.Item(
             name=new_item_name.strip(),
             item_code=clean_code,
-            current_stock=quantity,
-            price=price if price is not None else 0.0,
-            supplier=vendor.strip() if vendor else "Approved Vendor",
+            current_stock=0,
+            price=0.0,
+            supplier="Approved Vendor",
             storage_site=site.strip() if site else "Store Yard",
             uom=uom,
             minimum_stock=0
@@ -237,24 +506,41 @@ async def create_transaction(
         db.add(new_item)
         db.flush()
         item = new_item
+        lot_vendor = item.supplier or "Approved Vendor"
+        lot_price = item.price or 0.0
     else:
         # --- EXISTING ITEM PATH ---
         item = db.query(models.Item).filter(models.Item.id == int(item_id)).first()
         if not item:
             return HTMLResponse("<script>alert('Item not found.'); window.location='/';</script>")
-        # Update price and vendor if provided (prices can change between transactions)
-        if price is not None and price > 0:
-            item.price = price
-        if vendor and vendor.strip():
-            item.supplier = vendor.strip()
         # Lock UOM: only set if not already set; once set, it stays fixed
         if not item.uom:
             item.uom = uom
-        # Use locked UOM for this transaction
         uom = item.uom
-        item.current_stock += quantity
 
-    item_unit_price = item.price if item.price is not None else 0.0
+        # Vendor + price are NO LONGER entered here — they come from the admin's
+        # procurement pricing. Use the oldest placed order for this item.
+        placed_orders = db.query(models.ProcurementRequest).filter(
+            models.ProcurementRequest.item_id == item.id,
+            models.ProcurementRequest.status == "Order Placed"
+        ).order_by(models.ProcurementRequest.timestamp.asc()).all()
+        source_order = placed_orders[0] if placed_orders else None
+
+        if source_order and source_order.vendor:
+            lot_vendor = source_order.vendor
+        else:
+            lot_vendor = item.supplier or "Approved Vendor"
+        if source_order and source_order.unit_price is not None:
+            lot_price = float(source_order.unit_price)
+        else:
+            lot_price = item.price or 0.0
+
+        # Reflect this receipt as the item's last-known (previous) vendor/price
+        item.supplier = lot_vendor
+        item.price = lot_price
+
+    add_to_lot(db, item, lot_vendor, lot_price, quantity)
+    item_unit_price = lot_price
 
     # current_user is Received By
     received_by_name = current_user.full_name or current_user.username
@@ -278,16 +564,17 @@ async def create_transaction(
         quantity=quantity,
         uom=uom,
         received_by=received_by_name,
+        vendor=lot_vendor,
+        unit_price=item_unit_price,
+        grn_no=(grn_no.strip() if grn_no else None),
+        challan_no=(challan_no.strip() if challan_no else None),
         grn_filename=safe_filename,
+        grn_filedata=contents,
         uploaded_by_id=current_user.id
     ))
 
-    # Auto-mark any "Order Placed" procurement for this item as Delivered
-    open_orders = db.query(models.ProcurementRequest).filter(
-        models.ProcurementRequest.item_id == item.id,
-        models.ProcurementRequest.status == "Order Placed"
-    ).all()
-    for ord_req in open_orders:
+    # Mark the placed order(s) for this item as Delivered
+    for ord_req in placed_orders:
         ord_req.status = "Delivered"
 
     db.commit()
@@ -368,14 +655,16 @@ async def inward_bulk_import(
                 import random, string as _string
                 gen_code = "EIPL-" + ''.join(random.choices(_string.ascii_uppercase, k=2)) + "-" + ''.join(random.choices(_string.digits, k=2))
                 new_item = models.Item(
-                    name=item_name, item_code=gen_code, current_stock=quantity,
+                    name=item_name, item_code=gen_code, current_stock=0,
                     price=price, supplier=vendor, storage_site=site, uom=uom, minimum_stock=0
                 )
                 db.add(new_item)
                 db.flush()
+                add_to_lot(db, new_item, vendor, price, quantity)
                 db.add(models.Transaction(item_id=new_item.id, type="IN", quantity=quantity, user_id=current_user.id, total_value=float(quantity * price)))
                 db.add(models.GRNRecord(item_id=new_item.id, quantity=quantity, uom=uom,
                     received_by=current_user.full_name or current_user.username,
+                    vendor=vendor, unit_price=price,
                     grn_filename="BULK_CSV_IMPORT", uploaded_by_id=current_user.id))
                 added_count += 1
             else:
@@ -401,10 +690,13 @@ async def inward_bulk_import(
                     uom = item.uom  # Use locked uom
                     updated_count += 1
 
-                item.current_stock += quantity
+                lot_vendor = vendor if (vendor and vendor != "Approved Vendor") else item.supplier
+                lot_price = price if price > 0 else (item.price or 0.0)
+                add_to_lot(db, item, lot_vendor, lot_price, quantity)
                 db.add(models.Transaction(item_id=item.id, type="IN", quantity=quantity, user_id=current_user.id, total_value=float(quantity * item.price)))
                 db.add(models.GRNRecord(item_id=item.id, quantity=quantity, uom=uom,
                     received_by=current_user.full_name or current_user.username,
+                    vendor=lot_vendor, unit_price=lot_price,
                     grn_filename="BULK_CSV_IMPORT", uploaded_by_id=current_user.id))
 
         db.commit()
@@ -422,18 +714,27 @@ def grn_list(current_user: models.User = Depends(get_current_user), db: Session 
     rows = ""
     for g in grns:
         ts = g.timestamp.strftime("%d-%m-%Y %H:%M") if g.timestamp else ""
+        ts_iso = g.timestamp.strftime("%Y-%m-%d") if g.timestamp else ""
         item_name = g.item.name if g.item else "Unknown Item"
         item_code = g.item.item_code if g.item else "—"
         uploader = g.uploader.username if g.uploader else "System"
+        vendor = getattr(g, 'vendor', '') or '—'
+        grn_no = getattr(g, 'grn_no', '') or '—'
+        challan_no = getattr(g, 'challan_no', '') or '—'
         rows += f"""
-        <tr class="border-b hover:bg-slate-50 text-xs">
-            <td class="p-3 text-slate-500 font-mono">{ts}</td>
+        <tr class="border-b hover:bg-slate-50 text-xs grn-row"
+            data-date="{ts_iso}" data-item="{item_name.lower()}" data-code="{item_code.lower()}"
+            data-vendor="{vendor.lower()}" data-uploader="{uploader.lower()}" data-grn="{grn_no.lower()}">
+            <td class="p-3 text-slate-500 font-mono whitespace-nowrap">{ts}</td>
             <td class="p-3 font-semibold text-slate-800">{item_name}</td>
             <td class="p-3 font-mono text-slate-500">{item_code}</td>
             <td class="p-3 text-center font-mono font-bold text-slate-700">{g.quantity} {g.uom}</td>
+            <td class="p-3 text-slate-600">{vendor}</td>
+            <td class="p-3 font-mono text-slate-500 text-center">{grn_no}</td>
+            <td class="p-3 font-mono text-slate-500 text-center">{challan_no}</td>
             <td class="p-3 text-slate-500">{uploader}</td>
             <td class="p-3 text-right">
-                <a href="/grn/download/{g.id}" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all">⬇ Download</a>
+                <a href="/grn/download/{g.id}" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all">&#11015; Download</a>
             </td>
         </tr>"""
     html = f"""<!DOCTYPE html>
@@ -441,34 +742,166 @@ def grn_list(current_user: models.User = Depends(get_current_user), db: Session 
 <script src="https://cdn.tailwindcss.com"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<style>body{{font-family:'Inter',sans-serif;}}</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>body{{font-family:'Inter',sans-serif;}}.filter-input{{font-size:11px;padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;background:#f8fafc;width:100%;box-sizing:border-box;}}
+.filter-input:focus{{outline:none;border-color:#6366f1;background:#fff;}}</style>
 </head>
-<body class="bg-slate-50 min-h-screen p-8">
-    <div class="max-w-5xl mx-auto">
-        <div class="flex items-center justify-between mb-6">
+<body class="bg-slate-50 min-h-screen p-6">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex items-center justify-between mb-5">
             <div>
                 <a href="/" class="text-indigo-600 text-xs font-bold hover:underline">&#8592; Back to Dashboard</a>
                 <h1 class="text-xl font-black text-slate-900 mt-1">&#128196; GRN Download Centre</h1>
                 <p class="text-xs text-slate-400 mt-0.5">Goods Received Notes — uploaded inward transaction records</p>
             </div>
-            <a href="/mis/list" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-xs px-4 py-2 rounded-lg transition-all border border-indigo-200">&#128203; MIS Download Centre</a>
+            <div class="flex items-center gap-2">
+                <button onclick="exportGRN()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-4 py-2 rounded-lg transition-all flex items-center gap-1.5">
+                    <i class="fa-solid fa-file-excel"></i> Export Excel
+                </button>
+                <a href="/mis/list" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-xs px-4 py-2 rounded-lg transition-all border border-indigo-200">&#128203; MIS Centre</a>
+            </div>
         </div>
+
+        <!-- Filters Bar -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 mb-4 shadow-sm">
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 items-end">
+                <div class="lg:col-span-2">
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">&#128269; Search</label>
+                    <input type="text" id="grnSearch" placeholder="Item name, code, vendor..." oninput="applyGRNFilters()"
+                        class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">From Date</label>
+                    <input type="date" id="grnFrom" oninput="applyGRNFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">To Date</label>
+                    <input type="date" id="grnTo" oninput="applyGRNFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Item Code</label>
+                    <input type="text" id="grnCode" placeholder="Filter code..." oninput="applyGRNFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Vendor</label>
+                    <input type="text" id="grnVendor" placeholder="Filter vendor..." oninput="applyGRNFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Uploaded By</label>
+                    <input type="text" id="grnUploader" placeholder="Filter user..." oninput="applyGRNFilters()" class="filter-input">
+                </div>
+            </div>
+            <div class="flex items-center justify-between mt-2.5">
+                <span id="grnCount" class="text-[11px] text-slate-400 font-mono">Showing all records</span>
+                <div class="flex items-center gap-3">
+                    <button onclick="applyGRNFilters()" class="bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg transition-all flex items-center gap-1"><i class="fa-solid fa-filter"></i> Apply Filters</button>
+                    <button onclick="clearGRNFilters()" class="text-[10px] text-rose-500 font-bold hover:underline">Clear Filters</button>
+                </div>
+            </div>
+        </div>
+
         <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-            <table class="w-full text-left border-collapse">
+            <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse" id="grnTable">
                 <thead>
-                    <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase text-xs border-b border-slate-200">
-                        <th class="p-4">Timestamp</th>
-                        <th class="p-4">Item Name</th>
-                        <th class="p-4">Item Code</th>
-                        <th class="p-4 text-center">Qty / UOM</th>
-                        <th class="p-4">Uploaded By</th>
-                        <th class="p-4 text-right pr-5">Action</th>
+                    <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase text-[10px] border-b border-slate-200">
+                        <th class="p-3 whitespace-nowrap">Timestamp</th>
+                        <th class="p-3">Item Name</th>
+                        <th class="p-3">Item Code</th>
+                        <th class="p-3 text-center">Qty / UOM</th>
+                        <th class="p-3">Vendor</th>
+                        <th class="p-3 text-center">GRN No.</th>
+                        <th class="p-3 text-center">Challan No.</th>
+                        <th class="p-3">Uploaded By</th>
+                        <th class="p-3 text-right pr-4">Action</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-slate-100">{rows if rows else '<tr><td colspan="6" class="p-8 text-center text-slate-400 text-sm">No GRNs uploaded yet.</td></tr>'}</tbody>
+                <tbody class="divide-y divide-slate-100" id="grnTbody">{rows if rows else '<tr><td colspan="9" class="p-8 text-center text-slate-400 text-sm">No GRNs uploaded yet.</td></tr>'}</tbody>
             </table>
+            </div>
+            <!-- Pagination -->
+            <div class="flex items-center justify-between px-4 py-3 border-t border-slate-100 bg-slate-50/50">
+                <span class="text-[11px] text-slate-400" id="grnPageInfo"></span>
+                <div class="flex items-center gap-1" id="grnPagination"></div>
+            </div>
         </div>
     </div>
+
+<script>
+var GRN_PAGE = 1, GRN_PER_PAGE = 20, GRN_FILTERED = null;
+function getAllGRNRows() {{ return Array.from(document.querySelectorAll('#grnTbody .grn-row')); }}
+function applyGRNFilters() {{
+    var q = (document.getElementById('grnSearch').value||'').toLowerCase().trim();
+    var from = document.getElementById('grnFrom').value;
+    var to = document.getElementById('grnTo').value;
+    var code = (document.getElementById('grnCode').value||'').toLowerCase().trim();
+    var vendor = (document.getElementById('grnVendor').value||'').toLowerCase().trim();
+    var uploader = (document.getElementById('grnUploader').value||'').toLowerCase().trim();
+    GRN_FILTERED = getAllGRNRows().filter(function(r) {{
+        var d = r.dataset.date||'';
+        if(from && d < from) return false;
+        if(to && d > to) return false;
+        if(q && !r.dataset.item.includes(q) && !r.dataset.code.includes(q) && !r.dataset.vendor.includes(q) && !r.dataset.grn.includes(q)) return false;
+        if(code && !r.dataset.code.includes(code)) return false;
+        if(vendor && !r.dataset.vendor.includes(vendor)) return false;
+        if(uploader && !r.dataset.uploader.includes(uploader)) return false;
+        return true;
+    }});
+    GRN_PAGE = 1;
+    renderGRNPage();
+}}
+function renderGRNPage() {{
+    var rows = GRN_FILTERED !== null ? GRN_FILTERED : getAllGRNRows();
+    var total = rows.length;
+    var pages = Math.ceil(total / GRN_PER_PAGE) || 1;
+    if(GRN_PAGE > pages) GRN_PAGE = pages;
+    var start = (GRN_PAGE-1)*GRN_PER_PAGE, end = start+GRN_PER_PAGE;
+    getAllGRNRows().forEach(function(r){{r.style.display='none';}});
+    rows.slice(start,end).forEach(function(r){{r.style.display='';}});
+    document.getElementById('grnCount').textContent = 'Showing ' + Math.min(start+1,total) + '–' + Math.min(end,total) + ' of ' + total + ' records';
+    document.getElementById('grnPageInfo').textContent = 'Page ' + GRN_PAGE + ' of ' + pages;
+    var pgDiv = document.getElementById('grnPagination');
+    pgDiv.innerHTML = '';
+    if(pages <= 1) return;
+    var mkBtn = function(label,pg,active) {{
+        var b = document.createElement('button');
+        b.textContent = label;
+        b.className = 'px-2.5 py-1 rounded text-[11px] font-bold border ' + (active ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50');
+        b.onclick = function(){{ GRN_PAGE=pg; renderGRNPage(); }};
+        return b;
+    }};
+    pgDiv.appendChild(mkBtn('«',1,false));
+    pgDiv.appendChild(mkBtn('‹',Math.max(1,GRN_PAGE-1),false));
+    for(var p=Math.max(1,GRN_PAGE-2);p<=Math.min(pages,GRN_PAGE+2);p++) pgDiv.appendChild(mkBtn(p,p,p===GRN_PAGE));
+    pgDiv.appendChild(mkBtn('›',Math.min(pages,GRN_PAGE+1),false));
+    pgDiv.appendChild(mkBtn('»',pages,false));
+}}
+function clearGRNFilters() {{
+    ['grnSearch','grnFrom','grnTo','grnCode','grnVendor','grnUploader'].forEach(function(id){{document.getElementById(id).value='';}});
+    GRN_FILTERED=null; GRN_PAGE=1; renderGRNPage();
+}}
+function exportGRN() {{
+    var from = document.getElementById('grnFrom').value;
+    var to = document.getElementById('grnTo').value;
+    var rows = GRN_FILTERED !== null ? GRN_FILTERED : getAllGRNRows();
+    var data = [['Timestamp','Item Name','Item Code','Qty','UOM','Vendor','GRN No.','Challan No.','Uploaded By']];
+    rows.forEach(function(r) {{
+        var cells = r.querySelectorAll('td');
+        data.push([
+            cells[0].textContent.trim(), cells[1].textContent.trim(), cells[2].textContent.trim(),
+            cells[3].textContent.trim().split(' ')[0], cells[3].textContent.trim().split(' ')[1]||'',
+            cells[4].textContent.trim(), cells[5].textContent.trim(), cells[6].textContent.trim(), cells[7].textContent.trim()
+        ]);
+    }});
+    var ws = XLSX.utils.aoa_to_sheet(data);
+    ws['!cols'] = [{{wch:18}},{{wch:28}},{{wch:14}},{{wch:8}},{{wch:8}},{{wch:22}},{{wch:14}},{{wch:14}},{{wch:14}}];
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'GRN Records');
+    var fname = 'EIPL_GRN_Export' + (from?'_from_'+from:'') + (to?'_to_'+to:'') + '.xlsx';
+    XLSX.writeFile(wb, fname);
+}}
+window.onload = function() {{ renderGRNPage(); }};
+</script>
 </body></html>"""
     return HTMLResponse(html)
 
@@ -478,14 +911,25 @@ def grn_download(grn_id: int, current_user: models.User = Depends(get_current_us
     if not current_user:
         return RedirectResponse(url="/login", status_code=303)
     import os
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, Response
     grn = db.query(models.GRNRecord).filter(models.GRNRecord.id == grn_id).first()
     if not grn:
         raise HTTPException(status_code=404, detail="GRN not found")
-    grn_path = os.path.join("grn_uploads", grn.grn_filename)
-    if not os.path.exists(grn_path):
-        raise HTTPException(status_code=404, detail="GRN file missing from server")
-    return FileResponse(path=grn_path, filename=grn.grn_filename, media_type="application/octet-stream")
+
+    # Preferred: bytes stored in the shared DB (works on every device)
+    if getattr(grn, "grn_filedata", None):
+        return Response(
+            content=grn.grn_filedata,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{grn.grn_filename}"'}
+        )
+
+    # Fallback: legacy records whose bytes only live on this machine's disk
+    grn_path = os.path.join("grn_uploads", grn.grn_filename or "")
+    if grn.grn_filename and os.path.exists(grn_path):
+        return FileResponse(path=grn_path, filename=grn.grn_filename, media_type="application/octet-stream")
+
+    raise HTTPException(status_code=404, detail="GRN file missing from server")
 
 
 @app.get("/mis/list", response_class=HTMLResponse)
@@ -498,19 +942,24 @@ def mis_list(current_user: models.User = Depends(get_current_user), db: Session 
     rows = ""
     for a in assignments:
         ts = a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else ""
+        ts_iso = a.timestamp.strftime("%Y-%m-%d") if a.timestamp else ""
         item_name = a.item.name if a.item else "Unknown Item"
         item_code = a.item.item_code if a.item else "—"
         dept = getattr(a, 'department', '—') or '—'
+        issued_by = getattr(a, 'issued_by', '—') or '—'
         rows += f"""
-        <tr class="border-b hover:bg-slate-50 text-xs">
-            <td class="p-3 text-slate-500 font-mono">{ts}</td>
+        <tr class="border-b hover:bg-slate-50 text-xs mis-row"
+            data-date="{ts_iso}" data-item="{item_name.lower()}" data-code="{item_code.lower()}"
+            data-issued="{a.issued_to.lower() if a.issued_to else ''}" data-dept="{dept.lower()}" data-by="{issued_by.lower()}">
+            <td class="p-3 text-slate-500 font-mono whitespace-nowrap">{ts}</td>
             <td class="p-3 font-semibold text-slate-800">{item_name}</td>
             <td class="p-3 font-mono text-slate-500">{item_code}</td>
             <td class="p-3 text-center font-mono font-bold text-slate-700">{a.quantity} {a.uom}</td>
             <td class="p-3 text-slate-700 font-medium">{a.issued_to}</td>
             <td class="p-3 text-slate-500">{dept}</td>
+            <td class="p-3 text-slate-400 text-[11px]">{issued_by}</td>
             <td class="p-3 text-right">
-                <a href="/mis/download/{a.id}" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all">⬇ Download MIS</a>
+                <a href="/mis/download/{a.id}" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all">&#11015; Download MIS</a>
             </td>
         </tr>"""
     html = f"""<!DOCTYPE html>
@@ -518,35 +967,166 @@ def mis_list(current_user: models.User = Depends(get_current_user), db: Session 
 <script src="https://cdn.tailwindcss.com"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<style>body{{font-family:'Inter',sans-serif;}}</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>body{{font-family:'Inter',sans-serif;}}.filter-input{{font-size:11px;padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;background:#f8fafc;width:100%;box-sizing:border-box;}}
+.filter-input:focus{{outline:none;border-color:#6366f1;background:#fff;}}</style>
 </head>
-<body class="bg-slate-50 min-h-screen p-8">
-    <div class="max-w-5xl mx-auto">
-        <div class="flex items-center justify-between mb-6">
+<body class="bg-slate-50 min-h-screen p-6">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex items-center justify-between mb-5">
             <div>
                 <a href="/" class="text-indigo-600 text-xs font-bold hover:underline">&#8592; Back to Dashboard</a>
                 <h1 class="text-xl font-black text-slate-900 mt-1">&#128203; MIS Download Centre</h1>
                 <p class="text-xs text-slate-400 mt-0.5">Material Issue Slips — uploaded issuance records</p>
             </div>
-            <a href="/grn/list" class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-4 py-2 rounded-lg transition-all border border-slate-200">&#128196; GRN Download Centre</a>
+            <div class="flex items-center gap-2">
+                <button onclick="exportMIS()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-4 py-2 rounded-lg transition-all flex items-center gap-1.5">
+                    <i class="fa-solid fa-file-excel"></i> Export Excel
+                </button>
+                <a href="/grn/list" class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-4 py-2 rounded-lg transition-all border border-slate-200">&#128196; GRN Centre</a>
+            </div>
         </div>
+
+        <!-- Filters Bar -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 mb-4 shadow-sm">
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3 items-end">
+                <div class="lg:col-span-2">
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">&#128269; Search</label>
+                    <input type="text" id="misSearch" placeholder="Item name, code, issued to..." oninput="applyMISFilters()"
+                        class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">From Date</label>
+                    <input type="date" id="misFrom" oninput="applyMISFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">To Date</label>
+                    <input type="date" id="misTo" oninput="applyMISFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Item Code</label>
+                    <input type="text" id="misCode" placeholder="Filter code..." oninput="applyMISFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Issued To</label>
+                    <input type="text" id="misIssued" placeholder="Filter employee..." oninput="applyMISFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Department</label>
+                    <input type="text" id="misDept" placeholder="Filter dept..." oninput="applyMISFilters()" class="filter-input">
+                </div>
+            </div>
+            <div class="flex items-center justify-between mt-2.5">
+                <span id="misCount" class="text-[11px] text-slate-400 font-mono">Showing all records</span>
+                <div class="flex items-center gap-3">
+                    <button onclick="applyMISFilters()" class="bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg transition-all flex items-center gap-1"><i class="fa-solid fa-filter"></i> Apply Filters</button>
+                    <button onclick="clearMISFilters()" class="text-[10px] text-rose-500 font-bold hover:underline">Clear Filters</button>
+                </div>
+            </div>
+        </div>
+
         <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-            <table class="w-full text-left border-collapse">
+            <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse" id="misTable">
                 <thead>
-                    <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase text-xs border-b border-slate-200">
-                        <th class="p-4">Timestamp</th>
-                        <th class="p-4">Item Name</th>
-                        <th class="p-4">Item Code</th>
-                        <th class="p-4 text-center">Qty / UOM</th>
-                        <th class="p-4">Issued To</th>
-                        <th class="p-4">Department</th>
-                        <th class="p-4 text-right pr-5">Action</th>
+                    <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase text-[10px] border-b border-slate-200">
+                        <th class="p-3 whitespace-nowrap">Timestamp</th>
+                        <th class="p-3">Item Name</th>
+                        <th class="p-3">Item Code</th>
+                        <th class="p-3 text-center">Qty / UOM</th>
+                        <th class="p-3">Issued To</th>
+                        <th class="p-3">Department</th>
+                        <th class="p-3">Issued By</th>
+                        <th class="p-3 text-right pr-4">Action</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-slate-100">{rows if rows else '<tr><td colspan="7" class="p-8 text-center text-slate-400 text-sm">No MIS records uploaded yet.</td></tr>'}</tbody>
+                <tbody class="divide-y divide-slate-100" id="misTbody">{rows if rows else '<tr><td colspan="8" class="p-8 text-center text-slate-400 text-sm">No MIS records uploaded yet.</td></tr>'}</tbody>
             </table>
+            </div>
+            <!-- Pagination -->
+            <div class="flex items-center justify-between px-4 py-3 border-t border-slate-100 bg-slate-50/50">
+                <span class="text-[11px] text-slate-400" id="misPageInfo"></span>
+                <div class="flex items-center gap-1" id="misPagination"></div>
+            </div>
         </div>
     </div>
+
+<script>
+var MIS_PAGE = 1, MIS_PER_PAGE = 20, MIS_FILTERED = null;
+function getAllMISRows() {{ return Array.from(document.querySelectorAll('#misTbody .mis-row')); }}
+function applyMISFilters() {{
+    var q = (document.getElementById('misSearch').value||'').toLowerCase().trim();
+    var from = document.getElementById('misFrom').value;
+    var to = document.getElementById('misTo').value;
+    var code = (document.getElementById('misCode').value||'').toLowerCase().trim();
+    var issued = (document.getElementById('misIssued').value||'').toLowerCase().trim();
+    var dept = (document.getElementById('misDept').value||'').toLowerCase().trim();
+    MIS_FILTERED = getAllMISRows().filter(function(r) {{
+        var d = r.dataset.date||'';
+        if(from && d < from) return false;
+        if(to && d > to) return false;
+        if(q && !r.dataset.item.includes(q) && !r.dataset.code.includes(q) && !r.dataset.issued.includes(q)) return false;
+        if(code && !r.dataset.code.includes(code)) return false;
+        if(issued && !r.dataset.issued.includes(issued)) return false;
+        if(dept && !r.dataset.dept.includes(dept)) return false;
+        return true;
+    }});
+    MIS_PAGE = 1;
+    renderMISPage();
+}}
+function renderMISPage() {{
+    var rows = MIS_FILTERED !== null ? MIS_FILTERED : getAllMISRows();
+    var total = rows.length;
+    var pages = Math.ceil(total / MIS_PER_PAGE) || 1;
+    if(MIS_PAGE > pages) MIS_PAGE = pages;
+    var start = (MIS_PAGE-1)*MIS_PER_PAGE, end = start+MIS_PER_PAGE;
+    getAllMISRows().forEach(function(r){{r.style.display='none';}});
+    rows.slice(start,end).forEach(function(r){{r.style.display='';}});
+    document.getElementById('misCount').textContent = 'Showing ' + Math.min(start+1,total) + '–' + Math.min(end,total) + ' of ' + total + ' records';
+    document.getElementById('misPageInfo').textContent = 'Page ' + MIS_PAGE + ' of ' + pages;
+    var pgDiv = document.getElementById('misPagination');
+    pgDiv.innerHTML = '';
+    if(pages <= 1) return;
+    var mkBtn = function(label,pg,active) {{
+        var b = document.createElement('button');
+        b.textContent = label;
+        b.className = 'px-2.5 py-1 rounded text-[11px] font-bold border ' + (active ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50');
+        b.onclick = function(){{ MIS_PAGE=pg; renderMISPage(); }};
+        return b;
+    }};
+    pgDiv.appendChild(mkBtn('«',1,false));
+    pgDiv.appendChild(mkBtn('‹',Math.max(1,MIS_PAGE-1),false));
+    for(var p=Math.max(1,MIS_PAGE-2);p<=Math.min(pages,MIS_PAGE+2);p++) pgDiv.appendChild(mkBtn(p,p,p===MIS_PAGE));
+    pgDiv.appendChild(mkBtn('›',Math.min(pages,MIS_PAGE+1),false));
+    pgDiv.appendChild(mkBtn('»',pages,false));
+}}
+function clearMISFilters() {{
+    ['misSearch','misFrom','misTo','misCode','misIssued','misDept'].forEach(function(id){{document.getElementById(id).value='';}});
+    MIS_FILTERED=null; MIS_PAGE=1; renderMISPage();
+}}
+function exportMIS() {{
+    var from = document.getElementById('misFrom').value;
+    var to = document.getElementById('misTo').value;
+    var rows = MIS_FILTERED !== null ? MIS_FILTERED : getAllMISRows();
+    var data = [['Timestamp','Item Name','Item Code','Qty','UOM','Issued To','Department','Issued By']];
+    rows.forEach(function(r) {{
+        var cells = r.querySelectorAll('td');
+        var qtyuom = cells[3].textContent.trim().split(' ');
+        data.push([
+            cells[0].textContent.trim(), cells[1].textContent.trim(), cells[2].textContent.trim(),
+            qtyuom[0]||'', qtyuom[1]||'',
+            cells[4].textContent.trim(), cells[5].textContent.trim(), cells[6].textContent.trim()
+        ]);
+    }});
+    var ws = XLSX.utils.aoa_to_sheet(data);
+    ws['!cols'] = [{{wch:18}},{{wch:28}},{{wch:14}},{{wch:8}},{{wch:8}},{{wch:22}},{{wch:18}},{{wch:18}}];
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'MIS Records');
+    var fname = 'EIPL_MIS_Export' + (from?'_from_'+from:'') + (to?'_to_'+to:'') + '.xlsx';
+    XLSX.writeFile(wb, fname);
+}}
+window.onload = function() {{ renderMISPage(); }};
+</script>
 </body></html>"""
     return HTMLResponse(html)
 
@@ -556,16 +1136,248 @@ def mis_download(assignment_id: int, current_user: models.User = Depends(get_cur
     if not current_user:
         return RedirectResponse(url="/login", status_code=303)
     import os
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, Response
     a = db.query(models.MaterialAssignment).filter(models.MaterialAssignment.id == assignment_id).first()
     if not a or not a.mis_filename:
         raise HTTPException(status_code=404, detail="MIS not found")
+
+    # Preferred: bytes stored in the shared DB (works on every device)
+    if getattr(a, "mis_filedata", None):
+        return Response(
+            content=a.mis_filedata,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{a.mis_filename}"'}
+        )
+
+    # Fallback: legacy records whose bytes only live on this machine's disk
     mis_path = os.path.join("mis_uploads", a.mis_filename)
-    if not os.path.exists(mis_path):
-        raise HTTPException(status_code=404, detail="MIS file missing from server")
-    return FileResponse(path=mis_path, filename=a.mis_filename, media_type="application/octet-stream")
+    if os.path.exists(mis_path):
+        return FileResponse(path=mis_path, filename=a.mis_filename, media_type="application/octet-stream")
+
+    raise HTTPException(status_code=404, detail="MIS file missing from server")
 
 
+@app.get("/rts/list", response_class=HTMLResponse)
+def rts_list(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return-to-Store Slip Download Centre — same UI as the GRN Centre."""
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    returns = db.query(models.MaterialAssignment).filter(
+        models.MaterialAssignment.is_return == True,
+        models.MaterialAssignment.return_filename != None
+    ).order_by(models.MaterialAssignment.timestamp.desc()).all()
+    rows = ""
+    for a in returns:
+        ts = a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else ""
+        ts_iso = a.timestamp.strftime("%Y-%m-%d") if a.timestamp else ""
+        item_name = a.item.name if a.item else "Unknown Item"
+        item_code = a.item.item_code if a.item else "—"
+        returned_by = a.issued_to or "—"
+        recorded_by = a.mis_uploader.username if a.mis_uploader else (a.issued_by or "System")
+        dept = a.department or "—"
+        rows += f"""
+        <tr class="border-b hover:bg-slate-50 text-xs rts-row"
+            data-date="{ts_iso}" data-item="{item_name.lower()}" data-code="{item_code.lower()}"
+            data-returnedby="{returned_by.lower()}" data-uploader="{recorded_by.lower()}">
+            <td class="p-3 text-slate-500 font-mono whitespace-nowrap">{ts}</td>
+            <td class="p-3 font-semibold text-slate-800">{item_name}</td>
+            <td class="p-3 font-mono text-slate-500">{item_code}</td>
+            <td class="p-3 text-center font-mono font-bold text-slate-700">{a.quantity} {a.uom or ''}</td>
+            <td class="p-3 text-slate-600">{returned_by}</td>
+            <td class="p-3 text-slate-500">{dept}</td>
+            <td class="p-3 text-slate-500">{recorded_by}</td>
+            <td class="p-3 text-right">
+                <a href="/rts/download/{a.id}" class="bg-amber-500 hover:bg-amber-600 text-white font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all">&#11015; Download</a>
+            </td>
+        </tr>"""
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>RTS Downloads - EIPL</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>body{{font-family:'Inter',sans-serif;}}.filter-input{{font-size:11px;padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;background:#f8fafc;width:100%;box-sizing:border-box;}}
+.filter-input:focus{{outline:none;border-color:#f59e0b;background:#fff;}}</style>
+</head>
+<body class="bg-slate-50 min-h-screen p-6">
+    <div class="max-w-7xl mx-auto">
+        <div class="flex items-center justify-between mb-5">
+            <div>
+                <a href="/" class="text-amber-600 text-xs font-bold hover:underline">&#8592; Back to Dashboard</a>
+                <h1 class="text-xl font-black text-slate-900 mt-1">&#128230; Return to Store Slip Download Centre</h1>
+                <p class="text-xs text-slate-400 mt-0.5">Return-to-Store slips — uploaded material return records</p>
+            </div>
+            <div class="flex items-center gap-2">
+                <button onclick="exportRTS()" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-4 py-2 rounded-lg transition-all flex items-center gap-1.5">
+                    <i class="fa-solid fa-file-excel"></i> Export Excel
+                </button>
+                <a href="/grn/list" class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-xs px-4 py-2 rounded-lg transition-all border border-indigo-200">&#128196; GRN Centre</a>
+                <a href="/mis/list" class="bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold text-xs px-4 py-2 rounded-lg transition-all border border-rose-200">&#128203; MIS Centre</a>
+            </div>
+        </div>
+
+        <!-- Filters Bar -->
+        <div class="bg-white border border-slate-200 rounded-xl p-4 mb-4 shadow-sm">
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 items-end">
+                <div class="lg:col-span-2">
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">&#128269; Search</label>
+                    <input type="text" id="rtsSearch" placeholder="Item, code, employee..." oninput="applyRTSFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">From Date</label>
+                    <input type="date" id="rtsFrom" oninput="applyRTSFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">To Date</label>
+                    <input type="date" id="rtsTo" oninput="applyRTSFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Returned By</label>
+                    <input type="text" id="rtsReturnedBy" placeholder="Filter employee..." oninput="applyRTSFilters()" class="filter-input">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Recorded By</label>
+                    <input type="text" id="rtsUploader" placeholder="Filter user..." oninput="applyRTSFilters()" class="filter-input">
+                </div>
+            </div>
+            <div class="flex items-center justify-between mt-2.5">
+                <span id="rtsCount" class="text-[11px] text-slate-400 font-mono">Showing all records</span>
+                <div class="flex items-center gap-3">
+                    <button onclick="applyRTSFilters()" class="bg-amber-500 hover:bg-amber-600 text-white text-[10px] font-bold px-3 py-1.5 rounded-lg transition-all flex items-center gap-1"><i class="fa-solid fa-filter"></i> Apply Filters</button>
+                    <button onclick="clearRTSFilters()" class="text-[10px] text-rose-500 font-bold hover:underline">Clear Filters</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+            <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse" id="rtsTable">
+                <thead>
+                    <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase text-[10px] border-b border-slate-200">
+                        <th class="p-3 whitespace-nowrap">Timestamp</th>
+                        <th class="p-3">Item Name</th>
+                        <th class="p-3">Item Code</th>
+                        <th class="p-3 text-center">Qty / UOM</th>
+                        <th class="p-3">Returned By</th>
+                        <th class="p-3">Department</th>
+                        <th class="p-3">Recorded By</th>
+                        <th class="p-3 text-right pr-4">Action</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-100" id="rtsTbody">{rows if rows else '<tr><td colspan="8" class="p-8 text-center text-slate-400 text-sm">No Return-to-Store slips uploaded yet.</td></tr>'}</tbody>
+            </table>
+            </div>
+            <div class="flex items-center justify-between px-4 py-3 border-t border-slate-100 bg-slate-50/50">
+                <span class="text-[11px] text-slate-400" id="rtsPageInfo"></span>
+                <div class="flex items-center gap-1" id="rtsPagination"></div>
+            </div>
+        </div>
+    </div>
+
+<script>
+var RTS_PAGE = 1, RTS_PER_PAGE = 20, RTS_FILTERED = null;
+function getAllRTSRows() {{ return Array.from(document.querySelectorAll('#rtsTbody .rts-row')); }}
+function applyRTSFilters() {{
+    var q = (document.getElementById('rtsSearch').value||'').toLowerCase().trim();
+    var from = document.getElementById('rtsFrom').value;
+    var to = document.getElementById('rtsTo').value;
+    var emp = (document.getElementById('rtsReturnedBy').value||'').toLowerCase().trim();
+    var uploader = (document.getElementById('rtsUploader').value||'').toLowerCase().trim();
+    RTS_FILTERED = getAllRTSRows().filter(function(r) {{
+        var d = r.dataset.date||'';
+        if(from && d < from) return false;
+        if(to && d > to) return false;
+        if(q && !r.dataset.item.includes(q) && !r.dataset.code.includes(q) && !r.dataset.returnedby.includes(q)) return false;
+        if(emp && !r.dataset.returnedby.includes(emp)) return false;
+        if(uploader && !r.dataset.uploader.includes(uploader)) return false;
+        return true;
+    }});
+    RTS_PAGE = 1; renderRTSPage();
+}}
+function renderRTSPage() {{
+    var rows = RTS_FILTERED !== null ? RTS_FILTERED : getAllRTSRows();
+    var total = rows.length;
+    var pages = Math.ceil(total / RTS_PER_PAGE) || 1;
+    if(RTS_PAGE > pages) RTS_PAGE = pages;
+    var start = (RTS_PAGE-1)*RTS_PER_PAGE, end = start+RTS_PER_PAGE;
+    getAllRTSRows().forEach(function(r){{r.style.display='none';}});
+    rows.slice(start,end).forEach(function(r){{r.style.display='';}});
+    document.getElementById('rtsCount').textContent = 'Showing ' + Math.min(start+1,total) + '-' + Math.min(end,total) + ' of ' + total + ' records';
+    document.getElementById('rtsPageInfo').textContent = 'Page ' + RTS_PAGE + ' of ' + pages;
+    var pgDiv = document.getElementById('rtsPagination');
+    pgDiv.innerHTML = '';
+    if(pages <= 1) return;
+    var mkBtn = function(label,pg,active) {{
+        var b = document.createElement('button');
+        b.textContent = label;
+        b.className = 'px-2.5 py-1 rounded text-[11px] font-bold border ' + (active ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50');
+        b.onclick = function(){{ RTS_PAGE=pg; renderRTSPage(); }};
+        return b;
+    }};
+    pgDiv.appendChild(mkBtn('\u00ab',1,false));
+    pgDiv.appendChild(mkBtn('\u2039',Math.max(1,RTS_PAGE-1),false));
+    for(var p=Math.max(1,RTS_PAGE-2);p<=Math.min(pages,RTS_PAGE+2);p++) pgDiv.appendChild(mkBtn(p,p,p===RTS_PAGE));
+    pgDiv.appendChild(mkBtn('\u203a',Math.min(pages,RTS_PAGE+1),false));
+    pgDiv.appendChild(mkBtn('\u00bb',pages,false));
+}}
+function clearRTSFilters() {{
+    ['rtsSearch','rtsFrom','rtsTo','rtsReturnedBy','rtsUploader'].forEach(function(id){{document.getElementById(id).value='';}});
+    RTS_FILTERED=null; RTS_PAGE=1; renderRTSPage();
+}}
+function exportRTS() {{
+    var from = document.getElementById('rtsFrom').value;
+    var to = document.getElementById('rtsTo').value;
+    var rows = RTS_FILTERED !== null ? RTS_FILTERED : getAllRTSRows();
+    var data = [['Timestamp','Item Name','Item Code','Qty','UOM','Returned By','Department','Recorded By']];
+    rows.forEach(function(r) {{
+        var cells = r.querySelectorAll('td');
+        var qty = cells[3].textContent.trim().split(' ');
+        data.push([
+            cells[0].textContent.trim(), cells[1].textContent.trim(), cells[2].textContent.trim(),
+            qty[0]||'', qty.slice(1).join(' ')||'',
+            cells[4].textContent.trim(), cells[5].textContent.trim(), cells[6].textContent.trim()
+        ]);
+    }});
+    var ws = XLSX.utils.aoa_to_sheet(data);
+    ws['!cols'] = [{{wch:18}},{{wch:28}},{{wch:14}},{{wch:8}},{{wch:8}},{{wch:22}},{{wch:18}},{{wch:18}}];
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'RTS Records');
+    var fname = 'EIPL_RTS_Export' + (from?'_from_'+from:'') + (to?'_to_'+to:'') + '.xlsx';
+    XLSX.writeFile(wb, fname);
+}}
+window.onload = function() {{ renderRTSPage(); }};
+</script>
+</body></html>"""
+    return HTMLResponse(html)
+
+
+@app.get("/rts/download/{assignment_id}")
+def rts_download(assignment_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    import os
+    from fastapi.responses import FileResponse, Response
+    a = db.query(models.MaterialAssignment).filter(models.MaterialAssignment.id == assignment_id).first()
+    if not a or not a.return_filename:
+        raise HTTPException(status_code=404, detail="Return-to-Store slip not found")
+
+    # Preferred: bytes from shared DB
+    if getattr(a, "return_filedata", None):
+        return Response(
+            content=a.return_filedata,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{a.return_filename}"'}
+        )
+
+    # Fallback: bytes on local disk
+    rts_path = os.path.join("rts_uploads", a.return_filename)
+    if os.path.exists(rts_path):
+        return FileResponse(path=rts_path, filename=a.return_filename, media_type="application/octet-stream")
+
+    raise HTTPException(status_code=404, detail="Return-to-Store slip file missing from server")
+
+
+@app.post("/items/bulk-import")
 async def items_bulk_import(
     file: UploadFile = File(...),
     current_user: models.User = Depends(get_current_user),
@@ -681,10 +1493,13 @@ def add_item(
     name: str = Form(...),
     item_code: str = Form(...),
     price: float = Form(0.0),
-    initial_stock: int = Form(0),  # Fixed signature mapping to HTML key
+    initial_stock: int = Form(0),
     minimum_stock: int = Form(0),
+    current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
     existing_item = db.query(models.Item).filter(models.Item.item_code == item_code).first()
     if existing_item:
         raise HTTPException(status_code=400, detail="Item code already exists!")
@@ -705,7 +1520,7 @@ def add_item(
             item_id=db_item.id,
             type="IN",
             quantity=initial_stock,
-            user_id=1,
+            user_id=current_user.id,
             total_value=float(initial_stock * item_unit_price)
         )
         db.add(initial_transaction)
@@ -718,17 +1533,18 @@ def add_item(
 def edit_item(
     item_id: int,
     name: str = Form(...),
-    item_code: str = Form(...),  # Explicitly accept the form field data
+    item_code: str = Form(...),
     current_stock: int = Form(...),
     minimum_stock: int = Form(...),
     price: float = Form(...),
+    supplier: str = Form(""),
+    storage_site: str = Form(""),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
     if current_user.role != "Admin":
         return HTMLResponse("<html><body><h2>Access Denied: Admin privileges required</h2></body></html>", status_code=403)
         
-    # Changed models.InventoryItem to models.Item to match your schema definitions
     db_item = db.query(models.Item).filter(models.Item.id == item_id).first()
     if not db_item:
         raise HTTPException(status_code=404, detail="Item not found")
@@ -745,9 +1561,15 @@ def edit_item(
 
     db_item.name = name
     db_item.item_code = item_code.strip().upper()
-    db_item.current_stock = current_stock
+    stock_delta = current_stock - (db_item.current_stock or 0)
     db_item.minimum_stock = minimum_stock
     db_item.price = price
+    if supplier.strip():
+        db_item.supplier = supplier.strip()
+    if storage_site.strip():
+        db_item.storage_site = storage_site.strip()
+    # current_stock is updated by reconcile_stock_delta via the lot ledger
+    reconcile_stock_delta(db, db_item, stock_delta)
     db.commit()
     return RedirectResponse(url="/", status_code=303)
 
@@ -756,6 +1578,7 @@ def edit_item(
 def delete_item(item_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not current_user or current_user.role != "Admin":
         return HTMLResponse("Access Denied", status_code=403)
+    db.query(models.ItemLot).filter(models.ItemLot.item_id == item_id).delete()
     db.query(models.Transaction).filter(models.Transaction.item_id == item_id).delete()
     db.query(models.ProcurementRequest).filter(models.ProcurementRequest.item_id == item_id).delete()
     db.query(models.MaterialAssignment).filter(models.MaterialAssignment.item_id == item_id).delete()
@@ -776,7 +1599,8 @@ def update_stock_direct(
 
     item = db.query(models.Item).filter(models.Item.id == item_id).first()
     if item:
-        item.current_stock = int(new_stock)
+        delta = int(new_stock) - (item.current_stock or 0)
+        reconcile_stock_delta(db, item, delta)
         db.commit()
         
     return RedirectResponse(url="/", status_code=303)
@@ -788,7 +1612,7 @@ async def issue_materials(
     quantity: int = Form(...),
     uom: str = Form(...),
     issued_to: str = Form(...),
-    issued_by: str = Form(...),
+    issued_by: str = Form(None),
     department: str = Form("General Operations"),
     remarks: str = Form(None),
     mis_file: UploadFile = File(...),
@@ -797,6 +1621,10 @@ async def issue_materials(
 ):
     if not current_user:
         return RedirectResponse(url="/login", status_code=303)
+
+    # "Issued By" is the logged-in user recording the issue, not a form field
+    if not issued_by:
+        issued_by = current_user.full_name or current_user.username
 
     # MIS upload is mandatory to proceed
     if not mis_file or not mis_file.filename:
@@ -817,7 +1645,7 @@ async def issue_materials(
     with open(mis_path, "wb") as f:
         f.write(contents)
 
-    item.current_stock -= quantity
+    fifo_cost = consume_fifo(db, item, quantity)
 
     now = dt.datetime.utcnow()
     new_assignment = models.MaterialAssignment(
@@ -830,16 +1658,115 @@ async def issue_materials(
         remarks=remarks,
         custodian=issued_to,
         mis_filename=safe_filename,
+        mis_filedata=contents,
         mis_uploaded_by_id=current_user.id,
         mis_upload_timestamp=now,
         timestamp=now
     )
     db.add(new_assignment)
+
+    # Record outward transaction for the flow dashboard
+    db.add(models.Transaction(
+        item_id=item_id,
+        type="OUT",
+        quantity=quantity,
+        total_value=fifo_cost,
+        user_id=current_user.id,
+        timestamp=now
+    ))
+
     db.commit()
     return RedirectResponse(url="/?tab=allocations", status_code=303)
 
 
-@app.post("/procurement/request")
+@app.post("/material/return")
+async def return_to_store(
+    item_id: int = Form(...),
+    quantity: int = Form(...),
+    returned_by: str = Form(...),               # the employee returning the material
+    department: str = Form("General Operations"),
+    remarks: str = Form(None),
+    return_file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """Record a return-to-store: adds quantity back to inventory and logs
+    it as a Return row on material_assignments (is_return=True)."""
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+
+    # Return slip mandatory
+    if not return_file or not return_file.filename:
+        return HTMLResponse("<script>alert('Return-to-Store Slip is mandatory before recording a return.'); window.history.back();</script>")
+
+    if quantity <= 0:
+        return HTMLResponse("<script>alert('Return quantity must be greater than zero.'); window.history.back();</script>")
+
+    item = db.query(models.Item).filter(models.Item.id == item_id).first()
+    if not item:
+        return HTMLResponse("<script>alert('Item not found.'); window.history.back();</script>")
+
+    # Net issued to this employee = sum issues - sum prior returns
+    issued_total = db.query(models.MaterialAssignment).filter(
+        models.MaterialAssignment.item_id == item_id,
+        models.MaterialAssignment.issued_to == returned_by,
+        (models.MaterialAssignment.is_return == False) | (models.MaterialAssignment.is_return.is_(None))
+    ).all()
+    returned_total = db.query(models.MaterialAssignment).filter(
+        models.MaterialAssignment.item_id == item_id,
+        models.MaterialAssignment.issued_to == returned_by,
+        models.MaterialAssignment.is_return == True
+    ).all()
+    net_held = sum(a.quantity or 0 for a in issued_total) - sum(a.quantity or 0 for a in returned_total)
+    if quantity > net_held:
+        return HTMLResponse(f"<script>alert('Cannot return {quantity} units. {returned_by} currently holds only {net_held}.'); window.history.back();</script>")
+
+    # Save Return slip to disk + DB
+    import os, datetime as dt
+    rts_dir = "rts_uploads"
+    os.makedirs(rts_dir, exist_ok=True)
+    timestamp_str = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    safe_filename = f"RTS_{item.item_code}_{timestamp_str}_{return_file.filename.replace(' ', '_')}"
+    rts_path = os.path.join(rts_dir, safe_filename)
+    contents = await return_file.read()
+    with open(rts_path, "wb") as f:
+        f.write(contents)
+
+    # Add returned quantity back to inventory as a clearly-labelled return lot
+    # (price 0 — the units were already paid for through the original purchase)
+    return_vendor = f"Returned by {returned_by}"
+    add_to_lot(db, item, return_vendor, 0.0, quantity)
+
+    now = dt.datetime.utcnow()
+    db.add(models.MaterialAssignment(
+        item_id=item_id,
+        quantity=quantity,
+        uom=item.uom or "Nos",
+        issued_to=returned_by,                                      # the employee who held the item
+        issued_by=current_user.full_name or current_user.username,  # the store user recording the return
+        department=department,
+        remarks=remarks,
+        custodian=returned_by,
+        is_return=True,
+        return_filename=safe_filename,
+        return_filedata=contents,
+        mis_uploaded_by_id=current_user.id,
+        mis_upload_timestamp=now,
+        timestamp=now
+    ))
+
+    # Mirror as an IN-flavour transaction in the ledger (type RETURN)
+    db.add(models.Transaction(
+        item_id=item_id,
+        type="RETURN",
+        quantity=quantity,
+        total_value=0.0,
+        user_id=current_user.id,
+        timestamp=now
+    ))
+
+    db.commit()
+    return RedirectResponse(url="/?tab=allocations", status_code=303)
 def create_procurement_request(
     item_id: str = Form(...),
     quantity: int = Form(...),
@@ -1034,15 +1961,179 @@ async def procurement_bulk_import(
         return HTMLResponse(f"<script>alert('Import error: {str(e)}'); window.history.back();</script>")
 
 
+@app.get("/procurement/export-excel")
+def procurement_export_excel(
+    date_from: str = None,
+    date_to: str = None,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Export procurement pipeline to Excel with optional date range filter."""
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    import io, datetime as _dt
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return HTMLResponse("<script>alert('openpyxl not installed on server.'); window.history.back();</script>")
+
+    reqs = db.query(models.ProcurementRequest).order_by(models.ProcurementRequest.timestamp.desc()).all()
+
+    # Apply date filter
+    if date_from:
+        try:
+            dt_from = _dt.datetime.strptime(date_from, "%Y-%m-%d")
+            reqs = [r for r in reqs if r.timestamp and r.timestamp >= dt_from]
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            dt_to = _dt.datetime.strptime(date_to, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+            reqs = [r for r in reqs if r.timestamp and r.timestamp <= dt_to]
+        except ValueError:
+            pass
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Procurement Pipeline"
+
+    # Header styling
+    hdr_fill = PatternFill("solid", fgColor="1E293B")
+    hdr_font = Font(bold=True, color="FFFFFF", size=10)
+    hdr_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    headers = ["#", "Date", "Item Name", "Item Code", "Qty", "Est. Value (₹)", "Vendor", "Unit Rate (₹)", "Department", "Requested By", "Status", "Specification"]
+    col_widths = [4, 16, 30, 16, 8, 14, 22, 14, 18, 14, 14, 40]
+
+    for ci, (h, w) in enumerate(zip(headers, col_widths), 1):
+        cell = ws.cell(row=1, column=ci, value=h)
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.alignment = hdr_align
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+    ws.row_dimensions[1].height = 24
+
+    # Status colors
+    status_fills = {
+        "Pending": PatternFill("solid", fgColor="FEF9C3"),
+        "Order Pending": PatternFill("solid", fgColor="DBEAFE"),
+        "Order Placed": PatternFill("solid", fgColor="E0E7FF"),
+        "Delivered": PatternFill("solid", fgColor="D1FAE5"),
+        "Rejected": PatternFill("solid", fgColor="FEE2E2"),
+    }
+
+    for ri, r in enumerate(reqs, 2):
+        date_str = r.timestamp.strftime("%d-%m-%Y %H:%M") if r.timestamp else ""
+        if getattr(r, 'is_new_item', False):
+            raw_name = r.new_item_name or ""
+            if raw_name.startswith("[CODE:"):
+                item_code_str = raw_name[len("[CODE:"):raw_name.index("]")]
+                item_name_str = raw_name[raw_name.index("]") + 1:].strip() or "New Item"
+            else:
+                item_name_str = raw_name or "Unlisted Item"
+                item_code_str = "—"
+        else:
+            item_name_str = r.item.name if r.item else (r.new_item_name or "—")
+            item_code_str = r.item.item_code if r.item else "—"
+
+        row_data = [
+            ri - 1,
+            date_str,
+            item_name_str,
+            item_code_str,
+            r.quantity or 0,
+            round(r.total_estimated_cost or 0.0, 2),
+            r.vendor or "—",
+            round(r.unit_price or 0.0, 2) if r.unit_price else "—",
+            r.department or "—",
+            r.requester.username if r.requester else "—",
+            r.status or "—",
+            r.detailed_specification or "—"
+        ]
+        sfill = status_fills.get(r.status)
+        for ci, val in enumerate(row_data, 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.alignment = Alignment(horizontal="center" if ci in [1,4,5,6,8] else "left", vertical="center", wrap_text=(ci == 12))
+            if sfill:
+                cell.fill = sfill
+        ws.row_dimensions[ri].height = 15
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    suffix = ""
+    if date_from: suffix += f"_from_{date_from}"
+    if date_to: suffix += f"_to_{date_to}"
+    filename = f"EIPL_Procurement_Pipeline{suffix}.xlsx"
+
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+@app.post("/admin/verify-password")
+def admin_verify_password(
+    password: str = Form(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Returns JSON 200 if admin password is correct, 403 otherwise."""
+    from fastapi.responses import JSONResponse
+    if not current_user or current_user.role != "Admin":
+        return JSONResponse({"ok": False, "msg": "Not an admin account."}, status_code=403)
+    if current_user.hashed_password != hash_password(password):
+        return JSONResponse({"ok": False, "msg": "Incorrect admin password."}, status_code=403)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/procurement/set-pricing/{req_id}")
+def set_procurement_pricing(
+    req_id: int,
+    vendor: str = Form(...),
+    unit_price: float = Form(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    # Only the admin may enter vendor + rate, and only before the order is placed
+    if not current_user or current_user.role != "Admin":
+        return HTMLResponse("Unauthorized", status_code=403)
+    req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == req_id).first()
+    if req and req.status == "Order Pending":
+        v = (vendor or "").strip()
+        if not v or unit_price is None or unit_price < 0:
+            return HTMLResponse("<script>alert('Enter a valid vendor and rate.'); window.history.back();</script>")
+        req.vendor = v
+        req.unit_price = float(unit_price)
+        req.total_estimated_cost = float((req.quantity or 0) * float(unit_price))
+        # Mirror onto the catalog item so it shows as the latest known vendor/price
+        if req.item:
+            req.item.supplier = v
+            req.item.price = float(unit_price)
+        db.commit()
+    return RedirectResponse(url="/?tab=requisitions", status_code=303)
+
+
 @app.post("/procurement/order/{req_id}")
 def place_order(req_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not current_user or current_user.role != "Admin":
         return HTMLResponse("Unauthorized", status_code=403)
     req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == req_id).first()
     if req and req.status == "Order Pending":
+        # The order can only be placed once the admin has entered vendor + rate
+        if not (req.vendor and req.vendor.strip()) or req.unit_price is None:
+            return HTMLResponse("<script>alert('Enter vendor and rate before placing the order.'); window.history.back();</script>")
         req.status = "Order Placed"
         db.commit()
-    return RedirectResponse(url="/", status_code=303)
+    return RedirectResponse(url="/?tab=requisitions", status_code=303)
 
 
 @app.post("/procurement/action/{req_id}/{action_token}")
@@ -1128,7 +2219,7 @@ def edit_procurement_request(
     return RedirectResponse(url="/", status_code=303)
 
 
-@app.get("/procurement/delete/{request_id}")
+@app.post("/procurement/delete/{request_id}")
 def delete_procurement_request(
     request_id: int,
     session_user: str = Cookie(None),
@@ -1136,12 +2227,14 @@ def delete_procurement_request(
 ):
     if not session_user:
         return RedirectResponse(url="/login", status_code=303)
-        
+    # Admin-only: non-admins cannot delete procurement requests
+    user = db.query(models.User).filter(models.User.username == session_user).first()
+    if not user or user.role != "Admin":
+        return HTMLResponse("Access Denied: Admin privileges required to delete records.", status_code=403)
     req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == request_id).first()
     if req:
         db.delete(req)
         db.commit()
-        
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -1195,6 +2288,123 @@ def admin_edit_user(
         user.role = role.strip()
         db.commit()
     return RedirectResponse(url="/", status_code=303)
+
+
+@app.get("/account/password", response_class=HTMLResponse)
+def account_password_page(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    import html as _html
+
+    admin_reset_panel = ""
+    if current_user.role == "Admin":
+        staff_users = db.query(models.User).filter(models.User.role != "Admin").order_by(models.User.username).all()
+        rows = ""
+        for u in staff_users:
+            rows += f"""
+            <div class="flex items-center justify-between bg-slate-50 p-2.5 rounded-lg border border-slate-200 text-[11px] mb-1.5">
+                <div>
+                    <p class="font-bold text-slate-800">{_html.escape(u.username)} ({_html.escape(u.role)})</p>
+                    <p class="text-slate-500 text-[10px]">{_html.escape(u.full_name or '')}</p>
+                </div>
+                <button type="button" onclick="toggleResetForm({u.id})" class="text-indigo-600 font-bold hover:underline text-[10px]">set password</button>
+            </div>
+            <form id="resetForm{u.id}" action="/admin/users/set-password/{u.id}" method="POST" class="hidden mb-3 p-2.5 bg-indigo-50/50 border border-indigo-100 rounded-lg space-y-2">
+                <input type="password" name="new_password" placeholder="New password for {_html.escape(u.username)}" required minlength="4"
+                    class="w-full bg-white border border-slate-200 p-2 rounded-lg text-xs">
+                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white p-2 rounded-lg font-bold text-xs">Update Password</button>
+            </form>"""
+        admin_reset_panel = f"""
+        <div class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5 mt-6">
+            <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase border-b border-slate-100 pb-3 mb-3">&#128272; Reset Staff Password</h2>
+            <p class="text-[10px] text-slate-400 mb-3">As Admin, you can set a new password for any Staff account. Admin accounts cannot reset each other's passwords here.</p>
+            {rows if rows else '<p class="text-[11px] text-slate-400">No staff accounts found.</p>'}
+        </div>
+        <script>
+        function toggleResetForm(id) {{
+            var f = document.getElementById('resetForm' + id);
+            f.classList.toggle('hidden');
+        }}
+        </script>
+        """
+
+    html_page = f"""<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><title>Change Password - EIPL</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>body{{font-family:'Inter',sans-serif;}}</style>
+</head><body class="bg-slate-50 min-h-screen flex">
+{build_sidebar(current_user)}
+<div class="flex-1 flex flex-col min-h-screen overflow-x-hidden">
+<div class="bg-white border-b border-slate-200 h-16 flex items-center justify-between px-8 shrink-0 shadow-sm z-10">
+    <div class="flex items-center gap-2 text-xs font-semibold text-slate-400">
+        <span class="uppercase tracking-wider text-indigo-600 font-bold">EIPL Framework</span>
+        <i class="fa-solid fa-chevron-right text-[9px] text-slate-300"></i>
+        <span class="text-slate-700 font-medium">Change Password</span>
+    </div>
+    <span class="text-[11px] text-slate-400 font-mono">{_html.escape(current_user.username)} ({current_user.role})</span>
+</div>
+<div class="max-w-xl w-full mx-auto p-6">
+    <div class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5">
+        <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase border-b border-slate-100 pb-3 mb-3">&#128273; Change My Password</h2>
+        <form action="/account/change-password" method="POST" class="space-y-3 text-xs text-slate-700">
+            <div><label class="block font-semibold text-slate-500 mb-1">Current Password</label>
+                <input type="password" name="current_password" required class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-xs"></div>
+            <div><label class="block font-semibold text-slate-500 mb-1">New Password</label>
+                <input type="password" name="new_password" required minlength="4" class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-xs"></div>
+            <div><label class="block font-semibold text-slate-500 mb-1">Confirm New Password</label>
+                <input type="password" name="confirm_password" required minlength="4" class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-xs"></div>
+            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white p-2.5 rounded-xl font-bold tracking-wide transition-all text-xs">Update Password</button>
+        </form>
+    </div>
+    {admin_reset_panel}
+</div>
+</div>
+</body></html>"""
+    return HTMLResponse(html_page)
+
+
+@app.post("/account/change-password")
+def account_change_password(
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+    confirm_password: str = Form(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user:
+        return RedirectResponse(url="/login", status_code=303)
+    if current_user.hashed_password != hash_password(current_password):
+        return HTMLResponse("<script>alert('Current password is incorrect.'); window.history.back();</script>")
+    if new_password != confirm_password:
+        return HTMLResponse("<script>alert('New password and confirmation do not match.'); window.history.back();</script>")
+    if len(new_password) < 4:
+        return HTMLResponse("<script>alert('New password must be at least 4 characters.'); window.history.back();</script>")
+    current_user.hashed_password = hash_password(new_password)
+    db.commit()
+    return HTMLResponse("<script>alert('Password updated successfully.'); window.location='/account/password';</script>")
+
+
+@app.post("/admin/users/set-password/{target_id}")
+def admin_set_user_password(
+    target_id: int,
+    new_password: str = Form(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if not current_user or current_user.role != "Admin":
+        return HTMLResponse("Unauthorized", status_code=403)
+    target = db.query(models.User).filter(models.User.id == target_id).first()
+    if not target:
+        return HTMLResponse("<script>alert('User not found.'); window.location='/account/password';</script>")
+    if target.role == "Admin":
+        return HTMLResponse("<script>alert('Admins cannot reset another admin\\'s password.'); window.location='/account/password';</script>")
+    if len(new_password) < 4:
+        return HTMLResponse("<script>alert('New password must be at least 4 characters.'); window.history.back();</script>")
+    target.hashed_password = hash_password(new_password)
+    db.commit()
+    return HTMLResponse(f"<script>alert('Password updated for {target.username}.'); window.location='/account/password';</script>")
 
 
 @app.post("/admin/users/delete/{target_id}")
@@ -1279,20 +2489,17 @@ def build_sidebar(current_user) -> str:
         </div>
         <nav class="flex-1 p-4 space-y-1 overflow-y-auto">
             <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">Core Dashboard</p>
-            <a href="/material-movement" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
-                <i class="fa-solid fa-truck-ramp-box w-5 text-center text-slate-400 group-hover:text-emerald-600"></i> Material Movement
-            </a>
-            <a href="/inventory/summary" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
-                <i class="fa-solid fa-chart-bar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Material Flow Dashboard
-            </a>
-            <a href="/" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
-                <i class="fa-solid fa-boxes-stacked w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Inventory Configuration
-            </a>
             <a href="/?tab=requisitions" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
                 <i class="fa-solid fa-file-invoice-dollar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Requisitions
             </a>
+            <a href="/material-movement" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
+                <i class="fa-solid fa-truck-ramp-box w-5 text-center text-slate-400 group-hover:text-emerald-600"></i> Material Movement
+            </a>
+            <a href="/" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
+                <i class="fa-solid fa-boxes-stacked w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Inventory Configuration Log
+            </a>
             <a href="/?tab=allocations" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
-                <i class="fa-solid fa-list-check w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Allocations
+                <i class="fa-solid fa-list-check w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Allocation Log
             </a>
             <div class="pt-4 mt-4 border-t border-slate-100 space-y-1">
                 <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">Administration</p>
@@ -1307,6 +2514,12 @@ def build_sidebar(current_user) -> str:
                 </a>
                 <a href="/mis/list" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-medium transition-all group">
                     <i class="fa-solid fa-file-arrow-down w-4 text-center text-slate-400 group-hover:text-indigo-600"></i> MIS Download Centre
+                </a>
+                <a href="/rts/list" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-medium transition-all group">
+                    <i class="fa-solid fa-arrow-rotate-left w-4 text-center text-slate-400 group-hover:text-amber-600"></i> RTS Download Centre
+                </a>
+                <a href="/account/password" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-medium transition-all group">
+                    <i class="fa-solid fa-lock w-4 text-center text-slate-400 group-hover:text-indigo-600"></i> Change Password
                 </a>
             </div>
         </nav>
@@ -1327,327 +2540,21 @@ def build_sidebar(current_user) -> str:
     </aside>"""
 
 
-@app.get("/inventory/summary", response_class=HTMLResponse)
-def inventory_summary(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+
+@app.get("/rts/bulk-template")
+def rts_bulk_template(current_user: models.User = Depends(get_current_user)):
     if not current_user:
         return RedirectResponse(url="/login", status_code=303)
-
-    items = db.query(models.Item).all()
-    transactions = db.query(models.Transaction).all()
-    assignments = db.query(models.MaterialAssignment).all()
-    grns = db.query(models.GRNRecord).all()
-
-    import json as _json, html as _html
-
-    # Build transaction log per item
-    txn_map = {}
-    for t in transactions:
-        if t.item_id not in txn_map:
-            txn_map[t.item_id] = []
-        txn_map[t.item_id].append({
-            "date": t.timestamp.strftime("%d-%m-%Y %H:%M") if t.timestamp else "",
-            "type": t.type,
-            "qty": t.quantity,
-            "uom": "—",
-            "person": "—",
-            "direction": "IN" if t.type in ("IN","IN_PO") else "OUT"
-        })
-
-    # Build a price lookup from IN transactions: item_id -> {date_str: per_unit_price}
-    txn_price_lookup = {}
-    for t in transactions:
-        if t.type == "IN" and t.quantity and t.quantity > 0 and t.total_value:
-            per_unit = round(t.total_value / t.quantity, 2)
-            ts_str = t.timestamp.strftime("%d-%m-%Y %H:%M") if t.timestamp else ""
-            if t.item_id not in txn_price_lookup:
-                txn_price_lookup[t.item_id] = {}
-            txn_price_lookup[t.item_id][ts_str] = per_unit
-
-    # Overlay GRN data onto IN transactions with price/vendor info
-    grn_map = {}
-    for g in grns:
-        grn_map[g.item_id] = grn_map.get(g.item_id, [])
-        item_obj = next((i for i in items if i.id == g.item_id), None)
-        catalog_price = item_obj.price if item_obj else 0.0
-        catalog_vendor = item_obj.supplier if item_obj else "—"
-        grn_date = g.timestamp.strftime("%d-%m-%Y %H:%M") if g.timestamp else ""
-        # Match the per-unit price from the transaction recorded at same timestamp
-        entry_price = txn_price_lookup.get(g.item_id, {}).get(grn_date, catalog_price)
-        price_diff = round(entry_price - catalog_price, 2) if abs(entry_price - catalog_price) > 0.01 else None
-        grn_map[g.item_id].append({
-            "date": grn_date,
-            "type": "IN",
-            "qty": g.quantity,
-            "uom": g.uom or "Nos",
-            "person": getattr(g, 'received_by', '') or (g.uploader.username if g.uploader else "—"),
-            "direction": "IN",
-            "vendor": catalog_vendor,
-            "price": entry_price,
-            "price_diff": price_diff
-        })
-
-    # Overlay material assignments (OUT)
-    for a in assignments:
-        if a.item_id not in txn_map:
-            txn_map[a.item_id] = []
-        txn_map[a.item_id].append({
-            "date": a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "",
-            "type": "OUT",
-            "qty": a.quantity,
-            "uom": a.uom or "Nos",
-            "person": a.issued_to or "—",
-            "direction": "OUT"
-        })
-
-    rows_html = ""
-    is_admin = current_user.role == "Admin"
-    for it in items:
-        item_cat = getattr(it, 'category', '—')
-        item_sup = getattr(it, 'supplier', '—')
-        low_badge = ' <span class="text-rose-500 font-black text-[9px] animate-pulse">LOW</span>' if it.current_stock <= it.minimum_stock else ""
-
-        # Build txn log: merge GRN entries + assignments, sort by date desc
-        all_txns = grn_map.get(it.id, []) + [t for t in txn_map.get(it.id, []) if t["direction"] == "OUT"]
-        all_txns.sort(key=lambda x: x["date"], reverse=True)
-
-        txn_rows = ""
-        for tx in all_txns:
-            color = "text-emerald-600 bg-emerald-50" if tx["direction"] == "IN" else "text-rose-600 bg-rose-50"
-            person_label = f"<span class='text-slate-500'>Recv: {_html.escape(tx['person'])}</span>" if tx["direction"] == "IN" else f"<span class='text-slate-500'>Issued: {_html.escape(tx['person'])}</span>"
-            txn_rows += f"""<tr class='border-b border-slate-100 text-[11px]'>
-                <td class='px-3 py-2 font-mono text-slate-400'>{tx['date']}</td>
-                <td class='px-3 py-2'><span class='font-bold px-1.5 py-0.5 rounded {color}'>{tx['type']}</span></td>
-                <td class='px-3 py-2 font-mono font-bold'>{tx['qty']}</td>
-                <td class='px-3 py-2 text-slate-500'>{tx['uom']}</td>
-                <td class='px-3 py-2'>{person_label}</td>
-            </tr>"""
-
-        if not txn_rows:
-            txn_rows = "<tr><td colspan='5' class='px-3 py-4 text-center text-slate-400 text-[11px]'>No transactions recorded.</td></tr>"
-
-        txn_json = _json.dumps(all_txns)
-        safe_name = _html.escape(it.name)
-        safe_code = _html.escape(it.item_code)
-
-        admin_cols = f"""<td class="p-3 text-slate-600 text-[11px]">{item_sup}</td>
-            <td class="p-3 font-mono text-slate-700">&#8377;{it.price:,.2f}</td>""" if is_admin else ""
-
-        rows_html += f"""<tr class="border-b border-slate-100 hover:bg-slate-50/50 text-xs" data-name="{safe_name.lower()}" data-code="{safe_code.lower()}" data-supplier="{_html.escape(item_sup).lower()}">
-            <td class="p-3 font-semibold text-slate-900">{safe_name}{low_badge}<div class="text-[10px] text-slate-400">{item_cat}</div></td>
-            <td class="p-3 font-mono text-slate-500 text-[11px]">{safe_code}</td>
-            {admin_cols}
-            <td class="p-3 font-mono font-bold text-center {'text-rose-600' if it.current_stock <= it.minimum_stock else 'text-slate-900'}">{it.current_stock}</td>
-            <td class="p-3 font-mono text-center text-slate-400">{it.minimum_stock}</td>
-            <td class="p-3 text-center">
-                <button onclick="openTxnLog({it.id}, '{safe_name}', '{safe_code}')"
-                    class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all flex items-center gap-1 mx-auto">
-                    <i class="fa-solid fa-book-open text-[9px]"></i> Log
-                </button>
-            </td>
-        </tr>
-        <script>window.__txnData = window.__txnData||{{}};window.__txnData[{it.id}]={txn_json};</script>"""
-
-    html = f"""<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8"><title>Material Flow Dashboard - EIPL</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<style>body{{font-family:'Inter',sans-serif;}}
-.modal-bg{{position:fixed;inset:0;background:rgba(15,23,42,0.5);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:999;}}
-</style>
-</head>
-<body class="bg-slate-50 min-h-screen flex">
-{build_sidebar(current_user)}
-<div class="flex-1 flex flex-col min-h-screen overflow-x-hidden">
-<div class="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between sticky top-0 z-10 shadow-sm">
-    <div class="flex items-center gap-3">
-        <h1 class="text-sm font-black text-slate-900 uppercase tracking-wider"><i class="fa-solid fa-chart-bar text-indigo-600 mr-1"></i> Material Flow Dashboard</h1>
-    </div>
-    <div class="flex items-center gap-2">
-        <div class="relative">
-            <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
-            <input type="text" id="summarySearch" placeholder="Search items..." oninput="filterSummary()"
-                class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-48">
-        </div>
-        <select id="summaryPageSize" onchange="renderPage()" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl">
-            <option value="15">15 / page</option>
-            <option value="50">50 / page</option>
-            <option value="100">100 / page</option>
-        </select>
-        <select id="stockFilter" onchange="filterSummary()" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl">
-            <option value="">All Stock</option>
-            <option value="low">Low Stock Only</option>
-            <option value="ok">Adequate Stock</option>
-        </select>
-    </div>
-</div>
-
-<div class="max-w-[1400px] mx-auto p-6">
-    <div class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-        <table class="w-full text-left border-collapse" id="summaryTable">
-            <thead>
-                <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase text-xs border-b border-slate-200">
-                    <th class="p-4 pl-5 cursor-pointer hover:text-indigo-600" onclick="sortSummary(0)">Item Name <i class="fa-solid fa-sort text-[9px]"></i></th>
-                    <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortSummary(1)">Item Code <i class="fa-solid fa-sort text-[9px]"></i></th>
-                    {'<th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortSummary(2)">Vendor <i class="fa-solid fa-sort text-[9px]"></i></th><th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortSummary(3)">Price <i class="fa-solid fa-sort text-[9px]"></i></th>' if is_admin else ''}
-                    <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortSummary({'4' if is_admin else '2'})">Current Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
-                    <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortSummary({'5' if is_admin else '3'})">Safety Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
-                    <th class="p-4 text-center">Transaction Log</th>
-                </tr>
-            </thead>
-            <tbody id="summaryBody">{rows_html}</tbody>
-        </table>
-        <div class="flex items-center justify-between px-5 py-3 border-t border-slate-100 bg-slate-50/50 text-xs text-slate-500">
-            <span id="summaryInfo"></span>
-            <div id="summaryPagination" class="flex items-center gap-1"></div>
-        </div>
-    </div>
-</div>
-
-<!-- Transaction Log Modal -->
-<div id="txnModal" class="modal-bg hidden">
-    <div class="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-3xl mx-4 flex flex-col max-h-[80vh]">
-        <div class="flex items-center justify-between p-5 border-b border-slate-100">
-            <div>
-                <h3 class="text-sm font-black text-slate-900" id="txnModalTitle">Transaction Log</h3>
-                <p class="text-[10px] text-slate-400 mt-0.5" id="txnModalSubtitle"></p>
-            </div>
-            <button onclick="closeTxnLog()" class="text-slate-400 hover:text-slate-700 p-1.5 rounded-lg hover:bg-slate-100 transition-all">
-                <i class="fa-solid fa-xmark text-sm"></i>
-            </button>
-        </div>
-        <div class="overflow-y-auto flex-1">
-            <table class="w-full text-left border-collapse text-xs">
-                <thead class="sticky top-0">
-                    <tr class="bg-slate-50 text-slate-500 font-semibold uppercase tracking-wider border-b border-slate-200">
-                        <th class="px-4 py-3">Date</th>
-                        <th class="px-4 py-3">Type</th>
-                        <th class="px-4 py-3 text-center">Quantity</th>
-                        <th class="px-4 py-3">UOM</th>
-                        <th class="px-4 py-3">Person</th>
-                        {'<th class="px-4 py-3">Vendor</th><th class="px-4 py-3">Rate &#8377;</th><th class="px-4 py-3">Price Diff</th>' if is_admin else ''}
-                    </tr>
-                </thead>
-                <tbody id="txnLogBody"></tbody>
-            </table>
-        </div>
-        <div class="p-4 border-t border-slate-100 flex justify-end">
-            <button onclick="closeTxnLog()" class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-4 py-2 rounded-xl transition-all">Close</button>
-        </div>
-    </div>
-</div>
-
-<script>
-var allRows = Array.from(document.querySelectorAll('#summaryBody tr[data-name]'));
-var filtered = allRows;
-var currentPage = 1;
-var sortCol = -1, sortDir = 1;
-var IS_ADMIN = {'true' if is_admin else 'false'};
-
-function filterSummary() {{
-    var q = document.getElementById('summarySearch').value.toLowerCase();
-    var sf = document.getElementById('stockFilter').value;
-    filtered = allRows.filter(function(r) {{
-        var matchText = !q || r.dataset.name.includes(q) || r.dataset.code.includes(q) || r.dataset.supplier.includes(q);
-        var stocks = r.querySelectorAll('td');
-        var cur = parseInt(stocks[4] ? stocks[4].textContent : '0') || 0;
-        var safe = parseInt(stocks[5] ? stocks[5].textContent : '0') || 0;
-        var matchStock = !sf || (sf === 'low' ? cur <= safe : cur > safe);
-        return matchText && matchStock;
-    }});
-    currentPage = 1;
-    renderPage();
-}}
-
-function renderPage() {{
-    var ps = parseInt(document.getElementById('summaryPageSize').value) || 15;
-    var total = filtered.length;
-    var pages = Math.max(1, Math.ceil(total / ps));
-    if (currentPage > pages) currentPage = pages;
-    var start = (currentPage - 1) * ps;
-    var end = Math.min(start + ps, total);
-    allRows.forEach(function(r) {{ r.style.display = 'none'; }});
-    document.querySelectorAll('#summaryBody script').forEach(function(s) {{ s.style.display = 'none'; }});
-    for (var i = start; i < end; i++) {{ filtered[i].style.display = ''; }}
-    document.getElementById('summaryInfo').textContent = 'Showing ' + (start+1) + '-' + end + ' of ' + total + ' items';
-    var pb = document.getElementById('summaryPagination');
-    pb.innerHTML = '';
-    for (var p = 1; p <= pages; p++) {{
-        var btn = document.createElement('button');
-        btn.textContent = p;
-        btn.className = 'px-2.5 py-1 rounded-lg text-xs font-bold transition-all ' + (p === currentPage ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-indigo-50 hover:text-indigo-600');
-        btn.onclick = (function(pg) {{ return function() {{ currentPage = pg; renderPage(); }}; }})(p);
-        pb.appendChild(btn);
-    }}
-}}
-
-function sortSummary(col) {{
-    if (sortCol === col) sortDir = -sortDir; else {{ sortCol = col; sortDir = 1; }}
-    filtered.sort(function(a, b) {{
-        var at = a.querySelectorAll('td')[col] ? a.querySelectorAll('td')[col].textContent.trim() : '';
-        var bt = b.querySelectorAll('td')[col] ? b.querySelectorAll('td')[col].textContent.trim() : '';
-        var an = parseFloat(at.replace(/[^0-9.-]/g,'')), bn = parseFloat(bt.replace(/[^0-9.-]/g,''));
-        if (!isNaN(an) && !isNaN(bn)) return (an - bn) * sortDir;
-        return at.localeCompare(bt) * sortDir;
-    }});
-    renderPage();
-}}
-
-function openTxnLog(itemId, name, code) {{
-    document.getElementById('txnModalTitle').textContent = name + ' \u2014 Transaction Log';
-    document.getElementById('txnModalSubtitle').textContent = 'Code: ' + code;
-    var data = (window.__txnData && window.__txnData[itemId]) || [];
-    var tbody = document.getElementById('txnLogBody');
-    var colSpan = IS_ADMIN ? 8 : 5;
-    if (!data.length) {{
-        tbody.innerHTML = '<tr><td colspan="' + colSpan + '" class="px-4 py-6 text-center text-slate-400">No transactions found.</td></tr>';
-    }} else {{
-        tbody.innerHTML = data.map(function(tx) {{
-            var color = tx.direction === 'IN' ? 'bg-emerald-100 text-emerald-700' : 'bg-rose-100 text-rose-700';
-            var label = tx.direction === 'IN' ? 'Received by: ' : 'Issued to: ';
-            var adminCols = '';
-            if (IS_ADMIN && tx.direction === 'IN') {{
-                var priceStr = tx.price != null ? '\u20b9' + Number(tx.price).toFixed(2) : '\u2014';
-                var diffStr = '\u2014';
-                var diffClass = '';
-                if (tx.price_diff != null && tx.price_diff !== 0) {{
-                    var sign = tx.price_diff > 0 ? '+' : '';
-                    diffStr = sign + '\u20b9' + Number(tx.price_diff).toFixed(2);
-                    diffClass = tx.price_diff > 0 ? 'text-rose-600 font-bold' : 'text-emerald-600 font-bold';
-                }}
-                adminCols = '<td class="px-4 py-2.5 text-slate-500 text-[11px]">' + (tx.vendor || '\u2014') + '</td>' +
-                    '<td class="px-4 py-2.5 font-mono text-slate-700">' + priceStr + '</td>' +
-                    '<td class="px-4 py-2.5 font-mono ' + diffClass + '">' + diffStr + '</td>';
-            }} else if (IS_ADMIN) {{
-                adminCols = '<td class="px-4 py-2.5 text-slate-300">\u2014</td><td class="px-4 py-2.5 text-slate-300">\u2014</td><td class="px-4 py-2.5 text-slate-300">\u2014</td>';
-            }}
-            return '<tr class="border-b border-slate-100 hover:bg-slate-50">' +
-                '<td class="px-4 py-2.5 font-mono text-slate-400 text-[11px]">' + tx.date + '</td>' +
-                '<td class="px-4 py-2.5"><span class="font-bold px-2 py-0.5 rounded text-[11px] ' + color + '">' + tx.type + '</span></td>' +
-                '<td class="px-4 py-2.5 font-mono font-bold text-center">' + tx.qty + '</td>' +
-                '<td class="px-4 py-2.5 text-slate-500">' + tx.uom + '</td>' +
-                '<td class="px-4 py-2.5 text-slate-600 text-[11px]">' + label + '<b>' + tx.person + '</b></td>' +
-                adminCols +
-            '</tr>';
-        }}).join('');
-    }}
-    document.getElementById('txnModal').classList.remove('hidden');
-}}
-
-function closeTxnLog() {{
-    document.getElementById('txnModal').classList.add('hidden');
-}}
-
-document.getElementById('txnModal').addEventListener('click', function(e) {{
-    if (e.target === this) closeTxnLog();
-}});
-
-renderPage();
-</script>
-</div><!-- end flex-1 -->
-</body></html>"""
-    return HTMLResponse(html)
+    from fastapi.responses import StreamingResponse
+    import io
+    csv_content = "item_code,quantity,uom,returned_by,department,remarks\n"
+    csv_content += "EIPL-ST-01,2,Nos,Piyush Bhatia,Udaipur Project,Unused — returned to store\n"
+    csv_content += "EIPL-CC-02,5,Mtr,Biswajit Pradhan,Electrical Works,Excess cable returned\n"
+    return StreamingResponse(
+        io.StringIO(csv_content),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=EIPL_RTS_Bulk_Template.csv"}
+    )
 
 
 @app.get("/mis/bulk-template")
@@ -1714,7 +2621,8 @@ async def mis_bulk_import(
                 errors.append(f"Skipped {item_code} — insufficient stock ({item.current_stock} available)")
                 continue
 
-            item.current_stock -= quantity
+            bulk_fifo_cost = consume_fifo(db, item, quantity)
+            now_ts = _dt.datetime.utcnow()
             db.add(models.MaterialAssignment(
                 item_id=item.id,
                 quantity=quantity,
@@ -1724,7 +2632,16 @@ async def mis_bulk_import(
                 department=department,
                 remarks=remarks,
                 custodian=issued_to,
-                timestamp=_dt.datetime.utcnow()
+                timestamp=now_ts
+            ))
+            # Record outward transaction for the flow dashboard
+            db.add(models.Transaction(
+                item_id=item.id,
+                type="OUT",
+                quantity=quantity,
+                total_value=bulk_fifo_cost,
+                user_id=current_user.id,
+                timestamp=now_ts
             ))
             added += 1
 
@@ -1747,6 +2664,31 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
     import json as _json, html as _html
     inv_json = _json.dumps([{"id": i.id, "name": i.name, "code": i.item_code, "stock": i.current_stock,
         "uom": getattr(i,'uom',None) or "", "price": i.price or 0.0, "vendor": getattr(i,'supplier','') or ""} for i in items])
+
+    # Build map: {employee_name: [{item_id, name, code, uom, qty_held}]}
+    # qty_held = sum(issues) - sum(prior returns) for that (item, employee)
+    item_by_id = {i.id: i for i in items}
+    held = {}  # (emp, item_id) -> qty
+    all_assigns = db.query(models.MaterialAssignment).all()
+    for a in all_assigns:
+        if not a.issued_to or not a.item_id:
+            continue
+        key = (a.issued_to, a.item_id)
+        sign = -1 if getattr(a, "is_return", False) else +1
+        held[key] = held.get(key, 0) + sign * (a.quantity or 0)
+    held_map = {}
+    for (emp, iid), qty in held.items():
+        if qty <= 0:
+            continue
+        it = item_by_id.get(iid)
+        if not it:
+            continue
+        held_map.setdefault(emp, []).append({
+            "item_id": iid, "name": it.name, "code": it.item_code,
+            "uom": (it.uom or "Nos"), "qty_held": qty,
+        })
+    held_json = _json.dumps(held_map)
+
     emp_opts = "".join([f'<option value="{_html.escape(e.name)}">{_html.escape(e.name)} ({e.role_title})</option>' for e in employees])
     recv = _html.escape(current_user.full_name or current_user.username)
     html_page = f"""<!DOCTYPE html><html lang="en"><head>
@@ -1758,14 +2700,16 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
 </head><body class="bg-slate-50 min-h-screen flex">
 {build_sidebar(current_user)}
 <div class="flex-1 flex flex-col min-h-screen overflow-x-hidden">
-<div class="bg-white border-b border-slate-200 px-8 py-4 flex items-center justify-between sticky top-0 z-10 shadow-sm">
-    <div class="flex items-center gap-3">
-        <h1 class="text-sm font-black text-slate-900 uppercase tracking-wider"><i class="fa-solid fa-truck-ramp-box text-indigo-600 mr-1"></i> Material Movement</h1>
+<div class="bg-white border-b border-slate-200 h-16 flex items-center justify-between px-8 shrink-0 shadow-sm z-10">
+    <div class="flex items-center gap-2 text-xs font-semibold text-slate-400">
+        <span class="uppercase tracking-wider text-indigo-600 font-bold">EIPL Framework</span>
+        <i class="fa-solid fa-chevron-right text-[9px] text-slate-300"></i>
+        <span class="text-slate-700 font-medium">Material Movement</span>
     </div>
     <span class="text-[11px] text-slate-400 font-mono">{_html.escape(current_user.username)} ({current_user.role})</span>
 </div>
-<div class="max-w-[1400px] mx-auto p-6">
-  <div class="grid grid-cols-1 xl:grid-cols-2 gap-6 items-start">
+<div class="max-w-[1600px] mx-auto p-6">
+  <div class="grid grid-cols-1 xl:grid-cols-3 gap-6 items-start">
 
   <!-- LEFT: INWARD -->
   <div class="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
@@ -1773,7 +2717,7 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
       <div>
         <div class="flex items-center gap-2 mb-0.5">
           <span class="bg-emerald-500 text-white text-[10px] font-black px-2 py-0.5 rounded tracking-widest uppercase">Inward</span>
-          <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase">&#8595; Inward Transaction / Add to Catalog</h2>
+          <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase">&#8595; Only Material Inward</h2>
         </div>
         <p class="text-[10px] text-slate-400">Search existing item or register new — GRN mandatory</p>
       </div>
@@ -1781,25 +2725,15 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
     </div>
     <form action="/transaction" method="POST" enctype="multipart/form-data" class="p-5 space-y-3 text-xs text-slate-700">
       <div>
-        <label class="block font-semibold text-slate-600 mb-1">Search &amp; Select Item <span class="text-slate-400 font-normal">or add new below</span></label>
+        <label class="block font-semibold text-slate-600 mb-1">Search &amp; Select Item</label>
         <div class="relative">
           <input type="text" id="inward_item_search" placeholder="Type item name or code..." autocomplete="off"
             class="w-full bg-slate-50 border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-emerald-500 focus:bg-white shadow-sm text-xs"
             oninput="filterInwardItems(this.value)" onfocus="showInwardDropdown()">
           <div id="inward_item_dropdown" class="absolute z-30 w-full bg-white border border-slate-200 rounded-xl shadow-xl mt-1 max-h-48 overflow-y-auto hidden"></div>
         </div>
-        <input type="hidden" id="inward_item_id" name="item_id" value="NEW_INWARD_ITEM">
-        <p id="inward_selected_label" class="text-[10px] text-amber-600 font-semibold mt-1">+ New item — fill details below</p>
-      </div>
-      <div id="inward_new_item_fields" class="bg-amber-50/40 border border-amber-200/60 rounded-xl p-3 space-y-2.5">
-        <p class="text-[10px] font-bold text-amber-700 uppercase tracking-wider">New Item Details</p>
-        <div class="grid grid-cols-2 gap-2">
-          <div><label class="block font-semibold text-slate-500 mb-1">Item Name <span class="text-rose-500">*</span></label>
-            <input type="text" name="new_item_name" placeholder="e.g. Steel Pipe" class="w-full bg-white border border-slate-200 p-2 rounded-lg text-xs focus:outline-none focus:border-indigo-500"></div>
-          <div><label class="block font-semibold text-slate-500 mb-1">Item Code <span class="text-rose-500">*</span></label>
-            <input type="text" name="new_item_code" placeholder="e.g. EIPL-ST-05" class="w-full bg-white border border-slate-200 p-2 rounded-lg font-mono uppercase text-xs focus:outline-none focus:border-indigo-500" oninput="this.value=this.value.toUpperCase()"></div>
-        </div>
-        <input type="text" name="site" placeholder="Storage Site e.g. Udaipur Yard" class="w-full bg-white border border-slate-200 p-2 rounded-lg text-xs focus:outline-none focus:border-indigo-500">
+        <input type="hidden" id="inward_item_id" name="item_id" value="" required>
+        <p id="inward_selected_label" class="text-[10px] text-slate-400 mt-1 italic">No item selected</p>
       </div>
       <div class="grid grid-cols-2 gap-2">
         <div><label class="block font-semibold text-slate-500 mb-1">Quantity Received</label>
@@ -1813,10 +2747,10 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
           </select></div>
       </div>
       <div class="grid grid-cols-2 gap-2">
-        <div><label class="block font-semibold text-slate-500 mb-1">Vendor / Supplier</label>
-          <input type="text" name="vendor" placeholder="Supplier name" class="w-full bg-slate-50 border border-slate-200 p-2 rounded-lg text-xs"></div>
-        <div><label class="block font-semibold text-slate-500 mb-1">Rate &#8377;</label>
-          <input type="number" step="0.01" name="price" placeholder="0.00" class="w-full bg-slate-50 border border-slate-200 p-2 rounded-lg font-mono text-xs"></div>
+        <div><label class="block font-semibold text-slate-500 mb-1">GRN No.</label>
+          <input type="text" name="grn_no" placeholder="e.g. GRN-2026-001" class="w-full bg-slate-50 border border-slate-200 p-2 rounded-lg text-xs focus:outline-none focus:border-emerald-500"></div>
+        <div><label class="block font-semibold text-slate-500 mb-1">Challan / Invoice No.</label>
+          <input type="text" name="challan_no" placeholder="e.g. INV-4521" class="w-full bg-slate-50 border border-slate-200 p-2 rounded-lg text-xs focus:outline-none focus:border-emerald-500"></div>
       </div>
       <div class="bg-indigo-50/60 border border-indigo-100 rounded-lg p-2 text-[11px] text-indigo-700 font-medium">
         <i class="fa-solid fa-user-check mr-1"></i> Received By: <span class="font-black">{recv} ({_html.escape(current_user.username)})</span>
@@ -1842,7 +2776,7 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
     <div class="px-5 py-3 border-b-2 border-rose-400 bg-rose-50/60">
       <div class="flex items-center gap-2 mb-0.5">
         <span class="bg-rose-500 text-white text-[10px] font-black px-2 py-0.5 rounded tracking-widest uppercase">Outward</span>
-        <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase">&#8593; Material Issue Slip</h2>
+        <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase">&#8593; Material Issue</h2>
       </div>
       <p class="text-[10px] text-slate-400">Issue materials from store — MIS upload mandatory</p>
     </div>
@@ -1890,8 +2824,136 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
     </div>
   </div>
 
+  <!-- RIGHTMOST: RETURN TO STORE -->
+  <div class="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+    <div class="px-5 py-3 border-b-2 border-amber-400 bg-amber-50/60">
+      <div class="flex items-center justify-between mb-0.5">
+        <div class="flex items-center gap-2">
+          <span class="bg-amber-500 text-white text-[10px] font-black px-2 py-0.5 rounded tracking-widest uppercase">Return</span>
+          <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase">&#8634; Return to Store</h2>
+        </div>
+        <a href="/rts/bulk-template" class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-300 px-2 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 whitespace-nowrap"><i class="fa-solid fa-download"></i> Template</a>
+      </div>
+      <p class="text-[10px] text-slate-400">Take returned materials back into stock &mdash; slip mandatory</p>
+    </div>
+    <form action="/material/return" method="POST" enctype="multipart/form-data" class="p-5 space-y-3 text-xs text-slate-700">
+      <div>
+        <label class="block font-semibold text-slate-600 mb-1">Returning Employee</label>
+        <select id="rts_employee" name="returned_by" required onchange="onRtsEmployeeChange()"
+          class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl focus:outline-none focus:border-amber-500 focus:bg-white text-xs">
+          <option value="">-- Select Employee --</option>
+          {emp_opts}
+        </select>
+      </div>
+
+      <div id="rts_held_panel" class="hidden bg-amber-50/40 border border-amber-200/60 rounded-xl p-3">
+        <p class="text-[10px] font-bold text-amber-700 uppercase tracking-wider mb-1.5">Items currently held by this employee</p>
+        <div id="rts_held_list" class="space-y-1 text-[11px] text-slate-700 max-h-32 overflow-y-auto"></div>
+      </div>
+      <div id="rts_no_items" class="hidden bg-slate-50 border border-slate-200 rounded-xl p-3 text-center">
+        <p class="text-[11px] text-slate-500">No outstanding items for this employee.</p>
+      </div>
+
+      <div>
+        <label class="block font-semibold text-slate-600 mb-1">Item Being Returned</label>
+        <select id="rts_item" name="item_id" required disabled onchange="onRtsItemChange()"
+          class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl focus:outline-none focus:border-amber-500 focus:bg-white text-xs disabled:opacity-50">
+          <option value="">-- Select employee first --</option>
+        </select>
+      </div>
+
+      <div class="grid grid-cols-2 gap-2">
+        <div>
+          <label class="block font-semibold text-slate-500 mb-1">Quantity Returned</label>
+          <input type="number" id="rts_qty" name="quantity" min="1" value="1" required
+            class="w-full bg-slate-50 border border-slate-200 p-2 rounded-lg font-mono font-semibold text-xs">
+          <p id="rts_qty_help" class="text-[10px] text-slate-400 mt-0.5">Max: \u2014</p>
+        </div>
+        <div>
+          <label class="block font-semibold text-slate-500 mb-1">UOM (auto)</label>
+          <input type="text" id="rts_uom_display" readonly placeholder="\u2014"
+            class="w-full bg-slate-100 border border-slate-200 p-2 rounded-lg text-xs text-slate-500 cursor-not-allowed">
+        </div>
+      </div>
+
+      <div>
+        <label class="block font-semibold text-slate-500 mb-1">Department</label>
+        <input type="text" name="department" value="General Operations"
+          class="w-full bg-slate-50 border border-slate-200 p-2 rounded-lg text-xs">
+      </div>
+
+      <div>
+        <label class="block font-semibold text-slate-500 mb-1">Remarks <span class="text-slate-400 font-normal">(optional)</span></label>
+        <textarea name="remarks" rows="2" placeholder="Reason for return, condition, etc."
+          class="w-full bg-slate-50 border border-slate-200 p-2 rounded-lg text-xs resize-none"></textarea>
+      </div>
+
+      <div>
+        <label class="block font-semibold text-slate-500 mb-1">Upload Return-to-Store Slip <span class="text-rose-500 font-black">*</span></label>
+        <input type="file" name="return_file" required accept=".pdf,.jpg,.jpeg,.png,.xlsx,.xls,.doc,.docx"
+          class="w-full bg-amber-50 border border-amber-200 text-slate-700 text-[10px] p-2 rounded-lg">
+        <p class="text-[10px] text-amber-700 mt-0.5">&#9888; Return-to-Store Slip is mandatory</p>
+      </div>
+
+      <button type="submit" class="w-full bg-amber-500 hover:bg-amber-600 text-white p-2.5 rounded-xl font-bold tracking-wide transition-all text-xs">&#8634; Record Return to Store</button>
+    </form>
+  </div>
+
   </div><!-- end grid -->
 </div>
+
+<script id="mm-held" type="application/json">{held_json}</script>
+<script>
+var MMHELD = JSON.parse(document.getElementById('mm-held').textContent);
+function onRtsEmployeeChange() {{
+    var emp = document.getElementById('rts_employee').value;
+    var itemSel = document.getElementById('rts_item');
+    var panel = document.getElementById('rts_held_panel');
+    var noBox = document.getElementById('rts_no_items');
+    var listDiv = document.getElementById('rts_held_list');
+    var qty = document.getElementById('rts_qty');
+    var qtyHelp = document.getElementById('rts_qty_help');
+    var uomDisp = document.getElementById('rts_uom_display');
+    itemSel.innerHTML = '<option value="">-- Select item --</option>';
+    uomDisp.value = ''; qty.value = 1; qty.max = ''; qtyHelp.textContent = 'Max: \u2014';
+    if (!emp) {{
+        itemSel.disabled = true; panel.classList.add('hidden'); noBox.classList.add('hidden'); return;
+    }}
+    var rows = MMHELD[emp] || [];
+    if (!rows.length) {{
+        itemSel.disabled = true; panel.classList.add('hidden'); noBox.classList.remove('hidden'); return;
+    }}
+    noBox.classList.add('hidden');
+    panel.classList.remove('hidden');
+    listDiv.innerHTML = rows.map(function(r) {{
+        return '<div class="flex justify-between gap-2 border-b border-amber-100 last:border-0 pb-1">' +
+            '<span class="truncate"><b>' + r.name + '</b> <span class="text-slate-400 text-[10px]">(' + r.code + ')</span></span>' +
+            '<span class="font-mono text-amber-700 font-bold shrink-0">' + r.qty_held + ' ' + r.uom + '</span></div>';
+    }}).join('');
+    rows.forEach(function(r) {{
+        var opt = document.createElement('option');
+        opt.value = r.item_id;
+        opt.textContent = r.name + ' (' + r.code + ') \u2014 holding ' + r.qty_held + ' ' + r.uom;
+        opt.dataset.uom = r.uom; opt.dataset.max = r.qty_held;
+        itemSel.appendChild(opt);
+    }});
+    itemSel.disabled = false;
+}}
+function onRtsItemChange() {{
+    var sel = document.getElementById('rts_item');
+    var opt = sel.options[sel.selectedIndex];
+    var qty = document.getElementById('rts_qty');
+    var qtyHelp = document.getElementById('rts_qty_help');
+    var uomDisp = document.getElementById('rts_uom_display');
+    if (!opt || !opt.value) {{
+        uomDisp.value = ''; qty.max = ''; qtyHelp.textContent = 'Max: \u2014'; return;
+    }}
+    uomDisp.value = opt.dataset.uom || '';
+    qty.max = opt.dataset.max || '';
+    qty.value = 1;
+    qtyHelp.textContent = 'Max: ' + (opt.dataset.max || '\u2014') + ' ' + (opt.dataset.uom || '');
+}}
+</script>
 
 <script id="mm-inv" type="application/json">{inv_json}</script>
 <script>
@@ -1924,11 +2986,8 @@ document.addEventListener('click',function(e){{
         document.getElementById('inward_item_search').value=el.dataset.name+' ('+el.dataset.code+')';
         document.getElementById('inward_selected_label').textContent='Selected: '+el.dataset.name+' | Stock: '+el.dataset.stock;
         document.getElementById('inward_selected_label').className='text-[10px] text-indigo-600 font-semibold mt-1';
-        document.getElementById('inward_new_item_fields').style.display='none';
         document.getElementById('inward_item_dropdown').classList.add('hidden');
         if(el.dataset.uom)document.getElementById('inward_uom_select').value=el.dataset.uom;
-        if(el.dataset.price)document.querySelector('[name=price]').value=el.dataset.price;
-        if(el.dataset.vendor)document.querySelector('[name=vendor]').value=el.dataset.vendor;
         return;
     }}
     var el2=e.target.closest('.mis-item');
@@ -1958,6 +3017,10 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
     assignments = db.query(models.MaterialAssignment).all()
     employees = db.query(models.Employee).all()
     users = db.query(models.User).all()
+
+    # Per-item transaction logs for the merged log column / modal
+    import json as _json_txn
+    txn_logs = build_txn_logs(db, items)
 
     item_options = "".join([f'<option value="{i.id}">{i.name} ({i.item_code})</option>' for i in items])
     employee_options = "".join([f'<option value="{e.name}">{e.name} - {e.role_title}</option>' for e in employees])
@@ -2011,7 +3074,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
     };
 
     // 2. THE EDIT ITEM MENU — styled to match Procure widget panel
-    window.openEditItemModal = function(id, name, Unique_code, price, current_stock, minimum_stock) {
+    window.openEditItemModal = function(id, name, Unique_code, price, current_stock, minimum_stock, supplier, site) {
         let modal = document.getElementById('dynamicEditItemModal');
         if (!modal) {
             modal = document.createElement('div');
@@ -2059,6 +3122,18 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                         <input type="number" name="current_stock" value="` + current_stock + `" required
                             style="width:100%;padding:0.625rem 0.75rem;border:1px solid #e2e8f0;border-radius:0.625rem;font-size:0.8rem;font-family:monospace;color:#1e293b;box-sizing:border-box;">
                     </div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem;">
+                        <div>
+                            <label style="display:block;font-size:0.65rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.25rem;">Supplier / Vendor</label>
+                            <input type="text" name="supplier" value="` + (supplier||'') + `"
+                                style="width:100%;padding:0.625rem 0.75rem;border:1px solid #e2e8f0;border-radius:0.625rem;font-size:0.8rem;color:#1e293b;background:#f8fafc;box-sizing:border-box;" placeholder="Vendor name">
+                        </div>
+                        <div>
+                            <label style="display:block;font-size:0.65rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.25rem;">Storage Site</label>
+                            <input type="text" name="storage_site" value="` + (site||'') + `"
+                                style="width:100%;padding:0.625rem 0.75rem;border:1px solid #e2e8f0;border-radius:0.625rem;font-size:0.8rem;color:#1e293b;background:#f8fafc;box-sizing:border-box;" placeholder="e.g. Store Yard">
+                        </div>
+                    </div>
                     <div style="display:flex;justify-content:flex-end;gap:0.5rem;padding-top:0.75rem;border-top:1px solid #f1f5f9;margin-top:0.25rem;">
                         <button type="button" onclick="document.getElementById('dynamicEditItemModal').remove()"
                             style="padding:0.5rem 1.125rem;font-size:0.7rem;font-weight:700;color:#475569;background:#f1f5f9;border:none;border-radius:0.5rem;cursor:pointer;">Cancel</button>
@@ -2089,22 +3164,23 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
 
         if current_user.role == "Admin":
             admin_only_cells = f"""
-            <td class="p-3 text-slate-600 text-[11px] font-medium">{item_sup}</td>
-            <td class="p-3 font-mono text-slate-600">&#8377;{it.price:,.2f}</td>"""
+            <td class="p-3 text-slate-600 text-[11px] font-medium text-center">{item_sup}</td>
+            <td class="p-3 font-mono text-slate-600 text-center">&#8377;{it.price:,.2f}</td>"""
             action_cell = f"""
             <td class="p-3">
                 <div class="flex items-center gap-2">
                     <button type="button"
-                        data-action="procure"
+                        data-action="create-indent"
                         data-id="{it.id}" data-name="{h_name}" data-code="{h_code}"
-                        data-price="{it.price}" data-uom="{h_uom}" data-vendor="{h_vendor}"
-                        class="text-emerald-600 hover:underline font-bold text-[11px]">⬇ Inward</button>
+                        data-uom="{h_uom}" data-dept="{_html.escape(item_site, quote=True)}"
+                        class="text-indigo-600 hover:underline font-bold text-[11px]">+ Indent</button>
                     <button type="button"
                         data-action="edit-item"
                         data-id="{it.id}" data-name="{h_name}" data-code="{h_code}"
                         data-price="{it.price}" data-stock="{it.current_stock}" data-minstock="{it.minimum_stock}"
+                        data-supplier="{h_vendor}" data-site="{_html.escape(item_site, quote=True)}"
                         class="text-amber-600 hover:underline font-bold text-[11px]">Edit</button>
-                    <form action="/items/delete/{it.id}" method="POST" onsubmit="return confirm('Remove this item?');" class="inline m-0">
+                    <form action="/items/delete/{it.id}" method="POST" class="inline m-0 delete-protected-form" onsubmit="event.preventDefault(); openAdminDeleteModal(this, 'Delete item: {it.name} ({it.item_code})?');">
                         <button type="submit" class="text-rose-600 hover:underline font-bold text-[11px] bg-transparent border-none p-0 cursor-pointer inline">Delete</button>
                     </form>
                 </div>
@@ -2114,10 +3190,10 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             action_cell = f"""
             <td class="p-3">
                 <button type="button"
-                    data-action="procure"
+                    data-action="create-indent"
                     data-id="{it.id}" data-name="{h_name}" data-code="{h_code}"
-                    data-price="{it.price}" data-uom="{h_uom}" data-vendor="{h_vendor}"
-                    class="text-emerald-600 hover:underline font-bold text-[11px]">⬇ Inward</button>
+                    data-uom="{h_uom}" data-dept="{_html.escape(item_site, quote=True)}"
+                    class="text-indigo-600 hover:underline font-bold text-[11px]">+ Indent</button>
             </td>"""
 
         inventory_rows += f"""
@@ -2131,9 +3207,51 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             </td>
             <td class="p-3 font-mono text-[11px] text-slate-500">{it.item_code}</td>
             {admin_only_cells}
-            <td class="p-3 font-mono font-bold text-slate-900" data-sort="{it.current_stock}">{it.current_stock}</td>
+            <td class="p-3 font-mono font-bold text-slate-900" data-sort="{it.current_stock}">
+                {it.current_stock}
+                <span class="lot-toggle text-[10px] text-indigo-500 font-semibold cursor-pointer underline ml-1" data-target="lot-row-{it.id}">vendors</span>
+            </td>
             <td class="p-3 font-mono text-slate-400" data-sort="{it.minimum_stock}">{it.minimum_stock}</td>
             {action_cell}
+            <td class="p-3 text-center">
+                <button type="button"
+                    onclick="openTxnLog({it.id}, '{h_name}', '{h_code}')"
+                    class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all inline-flex items-center gap-1">
+                    <i class="fa-solid fa-book-open text-[9px]"></i> Log
+                </button>
+            </td>
+        </tr>
+        <script>window.__txnData = window.__txnData||{{}};window.__txnData[{it.id}]={_json_txn.dumps(txn_logs.get(it.id, []))};</script>
+        """
+
+        # Multi-vendor / multi-price lot breakdown — hidden by default, toggled via "vendors" link.
+        lots = db.query(models.ItemLot).filter(
+            models.ItemLot.item_id == it.id,
+            models.ItemLot.quantity > 0
+        ).order_by(models.ItemLot.received_at.asc()).all()
+
+        n_cols = 8 if current_user.role == "Admin" else 6
+        if lots:
+            lot_lines = "".join(
+                f"""<div class="flex items-center justify-between gap-3 py-1 px-2 odd:bg-white even:bg-slate-50 rounded">
+                        <span class="font-medium text-slate-600">{_html.escape(lot.vendor, quote=True)}</span>
+                        <span class="font-mono text-slate-400">&#8377;{lot.price:,.2f}</span>
+                        <span class="font-mono font-bold text-slate-800">{lot.quantity} {h_uom or ''}</span>
+                    </div>"""
+                for lot in lots
+            )
+        else:
+            lot_lines = '<div class="text-slate-400 italic px-2 py-1">No vendor lot records yet — recorded as a single combined balance.</div>'
+
+        inventory_rows += f"""
+        <tr id="lot-row-{it.id}" class="lot-detail-row hidden bg-slate-50/70 border-b border-slate-100">
+            <td colspan="{n_cols}" class="p-3">
+                <div class="text-[10px] uppercase font-bold text-slate-400 tracking-wider mb-1.5">Vendor / Price Lots for {h_name} (FIFO order — oldest first)</div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-1 text-[11px]">
+                    {lot_lines}
+                </div>
+                <div class="text-[10px] text-slate-400 mt-1.5">Total Quantity: <span class="font-bold text-slate-600">{it.current_stock} {h_uom or ''}</span> &bull; Outward issues consume the oldest lot first.</div>
+            </td>
         </tr>
         """
 
@@ -2226,11 +3344,26 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             po_name = _html.escape(r.item.name if r.item else (r.new_item_name or "Item"), quote=True)
             po_code = _html.escape(r.item.item_code if r.item else "N/A", quote=True)
             print_btn = f"""<button data-action="print-po" data-id="{r.id}" data-name="{po_name}" data-code="{po_code}" data-qty="{r.quantity}" class="bg-slate-700 hover:bg-slate-800 text-white text-[10px] font-bold px-2 py-0.5 rounded">&#128438; Print PO</button>"""
+            has_pricing = bool(r.vendor and r.vendor.strip()) and (r.unit_price is not None)
             if is_admin:
-                order_btn = f"""<form action="/procurement/order/{r.id}" method="POST" class="inline"><input type="submit" value="Order" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-2 py-0.5 rounded cursor-pointer text-[10px]"></form>"""
-                flow = f"""<div class="flex items-center gap-1 justify-center">{print_btn} {order_btn}</div>"""
+                cur_vendor = _html.escape(r.vendor or "", quote=True)
+                cur_rate = f"{r.unit_price:.2f}" if r.unit_price is not None else ""
+                # Admin enters vendor + rate here; the Order button unlocks only after both are saved
+                pricing_form = f"""<form action="/procurement/set-pricing/{r.id}" method="POST" class="flex items-center gap-1 justify-center flex-wrap">
+                        <input type="text" name="vendor" value="{cur_vendor}" placeholder="Vendor" required
+                            class="border border-slate-300 bg-white text-slate-900 text-[10px] px-1.5 py-1 rounded-lg w-24 focus:outline-none focus:border-indigo-500">
+                        <input type="number" step="0.01" min="0" name="unit_price" value="{cur_rate}" placeholder="Rate &#8377;" required
+                            class="border border-slate-300 bg-white text-slate-900 font-mono text-[10px] px-1.5 py-1 rounded-lg w-20 focus:outline-none focus:border-indigo-500">
+                        <button type="submit" class="bg-amber-500 hover:bg-amber-600 text-white font-bold text-[10px] px-2 py-1 rounded-lg">Save</button>
+                    </form>"""
+                if has_pricing:
+                    order_btn = f"""<form action="/procurement/order/{r.id}" method="POST" class="inline"><input type="submit" value="Order" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-2 py-0.5 rounded cursor-pointer text-[10px]"></form>"""
+                else:
+                    order_btn = """<span class="bg-slate-200 text-slate-400 font-bold px-2 py-0.5 rounded text-[10px] cursor-not-allowed" title="Enter vendor & rate to enable">Order</span>"""
+                flow = f"""<div class="flex flex-col items-center gap-1.5">{pricing_form}<div class="flex items-center gap-1 justify-center">{print_btn} {order_btn}</div></div>"""
             else:
-                flow = f"""<div class="flex justify-center">{print_btn}</div>"""
+                vendor_note = f"<span class='text-[10px] text-slate-500'>Vendor: <b>{_html.escape(r.vendor)}</b></span>" if has_pricing else "<span class='text-[10px] text-slate-400 italic'>Awaiting vendor &amp; rate</span>"
+                flow = f"""<div class="flex flex-col items-center gap-1">{print_btn}{vendor_note}</div>"""
 
         elif r.status == "Order Placed":
             po_name = _html.escape(r.item.name if r.item else (r.new_item_name or "Item"), quote=True)
@@ -2278,7 +3411,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             </form>
         </div>"""
 
-        req_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs align-middle" data-row="1" data-text="{date_str} {r.requester.username if r.requester else ''} {r.status} {r.department or ''}">
+        req_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs align-middle" data-row="1" data-date="{r.timestamp.strftime('%Y-%m-%d') if r.timestamp else ''}" data-text="{date_str} {r.requester.username if r.requester else ''} {r.status} {r.department or ''}">
             <td class="p-3 text-slate-500 font-mono whitespace-nowrap text-center">{date_str}</td>
             <td class="p-3 text-slate-800 text-center">{item_desc_display}</td>
             <td class="p-3 font-mono font-semibold text-center">{r.quantity}</td>
@@ -2297,12 +3430,19 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         ts = a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "—"
         item_name = a.item.name if a.item else 'Archived Asset'
         dept = getattr(a, 'department', '—') or '—'
+        is_ret = bool(getattr(a, 'is_return', False))
+        if is_ret:
+            qty_html = f'<span class="font-mono font-bold text-amber-700">+{a.quantity}</span> <span class="bg-amber-100 text-amber-700 text-[9px] font-black px-1.5 py-0.5 rounded ml-1">RETURN</span>'
+            person_label = "Returned by"
+        else:
+            qty_html = f'<span class="font-mono font-bold text-blue-700">{a.quantity}</span>'
+            person_label = "Issued to"
         assigned_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs" data-row="1">
             <td class="p-3 font-mono text-slate-400 text-[11px]">{ts}</td>
             <td class="p-3 font-bold text-slate-800">{item_name}</td>
-            <td class="p-3 font-mono font-bold text-blue-700 text-center" data-sort="{a.quantity}">{a.quantity}</td>
+            <td class="p-3 text-center" data-sort="{a.quantity}">{qty_html}</td>
             <td class="p-3 font-mono text-slate-500 text-center">{a.uom}</td>
-            <td class="p-3 text-slate-700 font-medium">{a.issued_to}</td>
+            <td class="p-3 text-slate-700 font-medium"><span class="text-[9px] text-slate-400 block leading-tight">{person_label}</span>{a.issued_to}</td>
             <td class="p-3 text-slate-500">{dept}</td>
             <td class="p-3 text-slate-400 italic text-[11px]">{a.remarks or '—'}</td>
         </tr>"""
@@ -2332,7 +3472,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                         data-id="{e.id}" data-name="{h_emp_name}" data-role="{h_emp_role}"
                         data-loc="{h_emp_loc}" data-contact="{h_emp_contact}"
                         class='text-indigo-600 font-bold hover:underline text-[10px]'>edit</button>
-                    <form action='/employees/delete/{e.id}' method='POST' class='inline'><input type='submit' value='delete' class='text-rose-500 font-bold cursor-pointer hover:underline bg-transparent border-0 text-[10px]'></form>
+                    <form action='/employees/delete/{e.id}' method='POST' class='inline delete-protected-form' onsubmit="event.preventDefault(); openAdminDeleteModal(this, 'Delete employee: {e.name}?');"><input type='submit' value='delete' class='text-rose-500 font-bold cursor-pointer hover:underline bg-transparent border-0 text-[10px]'></form>
                 </div>
             </div>"""
 
@@ -2353,11 +3493,13 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         """
 
         admin_panel = f"""
-        <div class="bg-white border border-slate-200 rounded-2xl shadow-sm p-5 text-center mb-4">
-            <i class="fa-solid fa-truck-ramp-box text-3xl text-emerald-500 mb-2"></i>
-            <h3 class="font-black text-slate-800 text-sm mb-1">Material Movement</h3>
-            <p class="text-[11px] text-slate-400 mb-3">Record inward &amp; outward material transactions</p>
-            <a href="/material-movement" class="bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs px-6 py-2.5 rounded-xl transition-all inline-block">Open Material Movement &#8594;</a>
+        <div class="bg-white border border-slate-200 rounded-xl shadow-sm p-4 mb-4 flex flex-col items-center text-center gap-2">
+            <i class="fa-solid fa-truck-ramp-box text-2xl text-emerald-500"></i>
+            <div>
+                <h3 class="font-black text-slate-800 text-xs leading-tight">Material Movement</h3>
+                <p class="text-[10px] text-slate-400 leading-tight mt-0.5">Inward &amp; outward transactions</p>
+            </div>
+            <a href="/material-movement" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] px-3 py-2 rounded-lg transition-all whitespace-nowrap">Open &#8594;</a>
         </div>
         """
 
@@ -2379,7 +3521,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                         data-id="{u.id}" data-name="{h_uname}" data-desig="{h_desig}"
                         data-loc="{h_loc}" data-role="{u.role}"
                         class='text-indigo-600 font-bold hover:underline text-[10px]'>edit</button>
-                    <form action='/admin/users/delete/{u.id}' method='POST' class='inline'><input type='submit' value='delete' class='text-rose-500 font-bold cursor-pointer hover:underline bg-transparent border-0 text-[10px]'></form>
+                    <form action='/admin/users/delete/{u.id}' method='POST' class='inline delete-protected-form' onsubmit="event.preventDefault(); openAdminDeleteModal(this, 'Delete user account: {u.username}?');"><input type='submit' value='delete' class='text-rose-500 font-bold cursor-pointer hover:underline bg-transparent border-0 text-[10px]'></form>
                 </div>
             </div>"""
 
