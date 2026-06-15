@@ -103,7 +103,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
 
     <aside class="w-64 bg-white border-r border-slate-200 flex flex-col shrink-0 shadow-sm z-20 sticky top-0 h-screen">
         <div class="p-5 border-b border-slate-100 text-center">
-            <img src="/static/logo.png" alt="EIPL Logo"
+            <img src="__LOGO_DATA_URL__" alt="EIPL Logo"
                 class="h-20 mx-auto mb-2 object-contain"
                 onerror="this.style.display='none';document.getElementById('logoFallback').style.display='inline-block';">
             <div id="logoFallback" style="display:none;" class="bg-indigo-600 px-3 py-2 rounded-xl text-white shadow-md shadow-indigo-600/20 font-black tracking-tighter text-sm mb-2">
@@ -199,7 +199,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
                             <div class="flex flex-wrap items-center gap-2">
                                 <div class="relative">
                                     <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
-                                    <input type="text" id="invSearch" placeholder="Search inventory..." oninput="filterTable('inv')"
+                                    <input type="text" id="invSearch" placeholder="Search inventory..." autocomplete="off" oninput="filterTable('inv')"
                                         class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-40">
                                 </div>
                                 <select id="invPageSize" onchange="changePageSize('inv')" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl focus:outline-none focus:border-indigo-400">
@@ -364,7 +364,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                 <!-- Search box -->
                                 <div class="relative">
                                     <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
-                                    <input type="text" id="reqSearch" placeholder="Search indents..." oninput="filterTable('req')"
+                                    <input type="text" id="reqSearch" placeholder="Search indents..." autocomplete="off" oninput="filterTable('req')"
                                         class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-44">
                                 </div>
                                 <!-- Status filter -->
@@ -430,7 +430,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                 <div class="flex flex-wrap items-center gap-2">
                                     <div class="relative">
                                         <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
-                                        <input type="text" id="allocSearch" placeholder="Search allocations..." oninput="filterTable('alloc')"
+                                        <input type="text" id="allocSearch" placeholder="Search allocations..." autocomplete="off" oninput="filterTable('alloc')"
                                             class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-40">
                                     </div>
                                     <select id="allocPageSize" onchange="changePageSize('alloc')" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl focus:outline-none focus:border-indigo-400">
