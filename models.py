@@ -40,6 +40,9 @@ class Item(Base):
     id = Column(Integer, primary_key=True, index=True)
     item_code = Column(String, unique=True, index=True) # ProductID
     name = Column(String, index=True)                  # Product Description
+    # Category controls serial tracking:
+    #   "Fixed Assets and Equipments" -> serial-tracked via AssetUnit
+    #   "Consumables" / "Tools and Tackles" -> count-based (lots)
     category = Column(String, default="Consumables")
     description = Column(String)
     supplier = Column(String, default="Approved Vendor")
@@ -48,6 +51,25 @@ class Item(Base):
     current_stock = Column(Integer, default=0)
     minimum_stock = Column(Integer, default=0)
     uom = Column(String, nullable=True)  # Fixed once set — cannot be changed after first transaction
+
+
+class AssetUnit(Base):
+    """One physical unit of a serial-tracked item (Fixed Assets and Equipments).
+    Identity persists across its whole lifecycle:
+        In Stock -> Issued -> (returned) -> In Stock -> ... -> Retired
+    `current_holder` is populated only while `status == 'Issued'`."""
+    __tablename__ = "asset_units"
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.id"), index=True)
+    serial_no = Column(String, unique=True, index=True)
+    status = Column(String, default="In Stock")        # "In Stock" | "Issued" | "Retired"
+    current_holder = Column(String, nullable=True)
+    current_assignment_id = Column(Integer, ForeignKey("material_assignments.id"), nullable=True)
+    acquired_at = Column(DateTime, default=datetime.datetime.utcnow)
+    retired_at = Column(DateTime, nullable=True)
+    notes = Column(String, nullable=True)
+
+    item = relationship("Item")
 
 
 class Employee(Base):
@@ -107,6 +129,8 @@ class MaterialAssignment(Base):
     is_return = Column(Boolean, default=False)                      # True for return-to-store rows
     return_filename = Column(String, nullable=True)                 # Return-to-Store slip filename
     return_filedata = Column(LargeBinary, nullable=True)            # Return-to-Store slip bytes (shared DB)
+    # --- SERIAL-TRACKED ASSET LINK (NULL for consumables and tools) ---
+    asset_unit_id = Column(Integer, ForeignKey("asset_units.id"), nullable=True)
 
     item = relationship("Item")
     mis_uploader = relationship("User", foreign_keys=[mis_uploaded_by_id])

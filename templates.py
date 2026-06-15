@@ -991,7 +991,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
             var tabParam = urlParams.get('tab');
             if (tabParam === 'allocations' || window.location.hash.includes('allocations')) {
                 switchTab('allocations');
-            } else if (window.location.hash.includes('requisitions')) {
+            } else if (tabParam === 'requisitions' || window.location.hash.includes('requisitions')) {
                 switchTab('requisitions');
             } else {
                 switchTab('inventory');
@@ -1481,6 +1481,84 @@ LAYOUT_HTML = """<!DOCTYPE html>
         }
         document.getElementById('txnModal').addEventListener('click', function(e) {
             if (e.target === this) closeTxnLog();
+        });
+    </script>
+
+    <!-- ===== Asset Register Modal (Fixed Assets and Equipments serial list) ===== -->
+    <div id="assetModal" style="display:none;" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm items-center justify-center z-[999] flex">
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-3xl mx-4 flex flex-col max-h-[80vh]">
+            <div class="flex items-center justify-between p-5 border-b border-slate-100">
+                <div>
+                    <h3 class="text-sm font-black text-slate-900" id="assetModalTitle">Asset Register</h3>
+                    <p class="text-[10px] text-slate-400 mt-0.5" id="assetModalSubtitle"></p>
+                </div>
+                <button onclick="closeAssetRegister()" class="text-slate-400 hover:text-slate-700 p-1.5 rounded-lg hover:bg-slate-100 transition-all">
+                    <i class="fa-solid fa-xmark text-sm"></i>
+                </button>
+            </div>
+            <div class="px-5 py-3 border-b border-slate-100 bg-amber-50/40 flex items-center gap-4 text-[11px] flex-wrap">
+                <span class="font-bold text-slate-600">Summary:</span>
+                <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-emerald-500"></span> In Stock <b id="assetStatIn">0</b></span>
+                <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-rose-500"></span> Issued <b id="assetStatIssued">0</b></span>
+                <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-slate-400"></span> Retired <b id="assetStatRetired">0</b></span>
+                <span class="ml-auto text-slate-400">Total <b id="assetStatTotal">0</b></span>
+            </div>
+            <div class="overflow-y-auto flex-1">
+                <table class="w-full text-left border-collapse text-xs">
+                    <thead class="sticky top-0">
+                        <tr class="bg-slate-50 text-slate-500 font-semibold uppercase tracking-wider border-b border-slate-200">
+                            <th class="px-4 py-3">Serial No.</th>
+                            <th class="px-4 py-3">Status</th>
+                            <th class="px-4 py-3">Current Holder</th>
+                            <th class="px-4 py-3">Acquired</th>
+                            <th class="px-4 py-3">Notes</th>
+                        </tr>
+                    </thead>
+                    <tbody id="assetRegBody"></tbody>
+                </table>
+            </div>
+            <div class="p-4 border-t border-slate-100 flex justify-end">
+                <button onclick="closeAssetRegister()" class="bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-4 py-2 rounded-xl transition-all">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function openAssetRegister(itemId, name, code) {
+            document.getElementById('assetModalTitle').textContent = name + ' \u2014 Asset Register';
+            document.getElementById('assetModalSubtitle').textContent = 'Code: ' + code + ' \u00b7 Fixed Assets & Equipments';
+            var data = (window.__assetData && window.__assetData[itemId]) || [];
+            var tbody = document.getElementById('assetRegBody');
+            var counts = {'In Stock': 0, 'Issued': 0, 'Retired': 0};
+            data.forEach(function(u){ if(counts.hasOwnProperty(u.status)) counts[u.status]++; });
+            document.getElementById('assetStatIn').textContent = counts['In Stock'];
+            document.getElementById('assetStatIssued').textContent = counts['Issued'];
+            document.getElementById('assetStatRetired').textContent = counts['Retired'];
+            document.getElementById('assetStatTotal').textContent = data.length;
+            if (!data.length) {
+                tbody.innerHTML = '<tr><td colspan="5" class="px-4 py-6 text-center text-slate-400">No asset units recorded yet. Inward this item with serial numbers to register units.</td></tr>';
+            } else {
+                tbody.innerHTML = data.map(function(u){
+                    var color;
+                    if (u.status === 'In Stock')      color = 'bg-emerald-100 text-emerald-700';
+                    else if (u.status === 'Issued')   color = 'bg-rose-100 text-rose-700';
+                    else                              color = 'bg-slate-100 text-slate-600';
+                    return '<tr class="border-b border-slate-100 hover:bg-slate-50">' +
+                        '<td class="px-4 py-2.5 font-mono font-bold text-slate-800">' + u.serial_no + '</td>' +
+                        '<td class="px-4 py-2.5"><span class="font-bold px-2 py-0.5 rounded text-[11px] ' + color + '">' + u.status + '</span></td>' +
+                        '<td class="px-4 py-2.5 text-slate-700">' + (u.current_holder || '\u2014') + '</td>' +
+                        '<td class="px-4 py-2.5 font-mono text-slate-500 text-[11px]">' + (u.acquired_at || '\u2014') + '</td>' +
+                        '<td class="px-4 py-2.5 text-slate-500 text-[11px] italic">' + (u.notes || '\u2014') + '</td>' +
+                    '</tr>';
+                }).join('');
+            }
+            document.getElementById('assetModal').style.display = 'flex';
+        }
+        function closeAssetRegister() {
+            document.getElementById('assetModal').style.display = 'none';
+        }
+        document.getElementById('assetModal').addEventListener('click', function(e) {
+            if (e.target === this) closeAssetRegister();
         });
     </script>
 </body>

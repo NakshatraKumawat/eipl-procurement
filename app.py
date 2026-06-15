@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import random
+import datetime as _ist_dt
 from io import StringIO
 from fastapi import FastAPI, Form, Depends, Cookie, Response, UploadFile, File, HTTPException, status
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -15,6 +16,29 @@ from database import engine, get_db, SessionLocal
 
 # Force absolute structural table synchronization on startup
 models.Base.metadata.create_all(bind=engine)
+
+# -------------------------------------------------------------
+# IST (INDIA STANDARD TIME) DISPLAY HELPERS
+# -------------------------------------------------------------
+# All timestamps are stored in the database as naive UTC datetimes
+# (via datetime.utcnow() defaults). For display anywhere in the UI,
+# convert to IST (UTC+5:30) before formatting.
+IST_OFFSET = _ist_dt.timedelta(hours=5, minutes=30)
+
+
+def to_ist(dt):
+    """Convert a naive UTC datetime to a naive IST datetime for display.
+    Returns None if dt is None."""
+    if dt is None:
+        return None
+    return dt + IST_OFFSET
+
+
+def fmt_ist(dt, fmt="%d-%m-%Y %H:%M"):
+    """Format a stored (naive UTC) datetime as IST. Returns '' if dt is None."""
+    if dt is None:
+        return ""
+    return to_ist(dt).strftime(fmt)
 
 # -------------------------------------------------------------
 # MULTI-VENDOR LOT / FIFO HELPERS
@@ -124,7 +148,7 @@ def build_txn_logs(db: Session, items):
     for t in transactions:
         if t.type == "IN" and t.quantity and t.quantity > 0 and t.total_value:
             per_unit = round(t.total_value / t.quantity, 2)
-            ts_str = t.timestamp.strftime("%d-%m-%Y %H:%M") if t.timestamp else ""
+            ts_str = fmt_ist(t.timestamp)
             txn_price_lookup.setdefault(t.item_id, {})[ts_str] = per_unit
 
     # Vendor recovery for legacy GRNs (no stored vendor): the actual vendor
@@ -157,7 +181,7 @@ def build_txn_logs(db: Session, items):
         catalog_price = (item_obj.price if item_obj else 0.0) or 0.0
         catalog_vendor = (item_obj.supplier if item_obj else "\u2014") or "\u2014"
         gdt = g.timestamp or _MIN
-        grn_date = g.timestamp.strftime("%d-%m-%Y %H:%M") if g.timestamp else ""
+        grn_date = fmt_ist(g.timestamp)
         unit_price = getattr(g, "unit_price", None)
         if unit_price is None:
             unit_price = txn_price_lookup.get(g.item_id, {}).get(grn_date, catalog_price)
@@ -173,6 +197,7 @@ def build_txn_logs(db: Session, items):
             "vendor": vendor, "price": round(unit_price or 0.0, 2),
             "grn_no": getattr(g, "grn_no", None) or "\u2014",
             "challan_no": getattr(g, "challan_no", None) or "\u2014",
+            "serial_no": "\u2014",
             "price_diff": None, "pct_diff": None,
         }
         in_entries.setdefault(g.item_id, []).append((gdt, entry))
@@ -190,25 +215,31 @@ def build_txn_logs(db: Session, items):
             prev_price = e["price"]
 
     # OUT entries from material assignments
-    # OUT entries (issues) and RETURN entries from material_assignments
+    # OUT entries (issues) and RETURN entries from material_assignments.
+    # For serial-tracked items, fetch the serial via asset_unit_id link.
+    unit_serials = {u.id: (u.serial_no or "\u2014") for u in db.query(models.AssetUnit).all()}
     out_entries = {}
     for a in assignments:
         adt = a.timestamp or _MIN
         is_ret = bool(getattr(a, "is_return", False))
+        serial = "\u2014"
+        aid = getattr(a, "asset_unit_id", None)
+        if aid:
+            serial = unit_serials.get(aid, "\u2014")
         if is_ret:
-            # A return puts stock back. Show as IN-direction but flagged "RETURN"
-            # so the modal doesn't render vendor/price/GRN data for it.
             entry = {
-                "date": a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "",
+                "date": fmt_ist(a.timestamp),
                 "type": "RETURN", "qty": a.quantity, "uom": a.uom or "Nos",
                 "person": a.issued_to or "\u2014", "direction": "IN",
+                "serial_no": serial,
                 "is_return": True,
             }
         else:
             entry = {
-                "date": a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "",
+                "date": fmt_ist(a.timestamp),
                 "type": "OUT", "qty": a.quantity, "uom": a.uom or "Nos",
                 "person": a.issued_to or "\u2014", "direction": "OUT",
+                "serial_no": serial,
             }
         out_entries.setdefault(a.item_id, []).append((adt, entry))
 
@@ -227,6 +258,15 @@ app = FastAPI(title="EIPL Enterprise Procurement Framework")
 # -------------------------------------------------------------
 ASSET_CLASSES = ["Fixed Assets and Equipments", "Consumables", "Tools and Tackles"]
 DEFAULT_ASSET_CLASS = "Consumables"
+# Only items in TRACKED_CATEGORIES are serial-tracked (one AssetUnit per physical thing).
+TRACKED_CATEGORIES = ("Fixed Assets and Equipments",)
+
+
+def is_tracked(item_or_category) -> bool:
+    """True if the item (or category string) is serial-tracked.
+    Accepts either an Item instance or a raw category string."""
+    cat = item_or_category if isinstance(item_or_category, str) else getattr(item_or_category, "category", None)
+    return cat in TRACKED_CATEGORIES
 
 
 def category_options_html(selected=None):
@@ -408,6 +448,11 @@ def run_structural_database_migrations():
                 _ddl_conn.execute(text("ALTER TABLE procurement_requests ADD COLUMN category TEXT"))
             except Exception:
                 pass
+            # --- Fixed Assets and Equipments per-unit tracking ---
+            try:
+                _ddl_conn.execute(text("ALTER TABLE material_assignments ADD COLUMN asset_unit_id INTEGER"))
+            except Exception:
+                pass
             _ddl_conn.commit()
     except Exception as e:
         print(f"[Migration] procurement_messages: {e}")
@@ -493,6 +538,8 @@ async def create_transaction(
     challan_no: str = Form(None),
     new_item_name: str = Form(None),
     new_item_code: str = Form(None),
+    new_item_category: str = Form(None),       # used when creating a new item
+    serial_numbers: str = Form(None),          # newline/comma-separated for tracked items
     site: str = Form(None),
     grn_file: UploadFile = File(None),
     current_user: models.User = Depends(get_current_user),
@@ -501,7 +548,6 @@ async def create_transaction(
     if not current_user:
         return RedirectResponse(url="/login", status_code=303)
 
-    # GRN file is mandatory
     if not grn_file or not grn_file.filename:
         return HTMLResponse("<script>alert('GRN Upload is mandatory before recording an Inward Transaction.'); window.history.back();</script>")
 
@@ -510,19 +556,22 @@ async def create_transaction(
     os.makedirs(grn_dir, exist_ok=True)
     timestamp_str = _dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-    placed_orders = []  # procurement orders this receipt fulfils
+    placed_orders = []
 
     if item_id == "NEW_INWARD_ITEM":
-        # --- NEW ITEM PATH (ad-hoc receipt; vendor/price come later via procurement) ---
         if not new_item_name or not new_item_code:
             return HTMLResponse("<script>alert('Item Name and Item Code are required for a new item.'); window.history.back();</script>")
         clean_code = new_item_code.strip().upper()
         existing = db.query(models.Item).filter(models.Item.item_code == clean_code).first()
         if existing:
             return HTMLResponse(f"<script>alert('Item Code {clean_code} already exists in catalog. Please use Search & Select for existing items.'); window.history.back();</script>")
+        cat = (new_item_category or "").strip()
+        if cat not in ASSET_CLASSES:
+            cat = DEFAULT_ASSET_CLASS
         new_item = models.Item(
             name=new_item_name.strip(),
             item_code=clean_code,
+            category=cat,
             current_stock=0,
             price=0.0,
             supplier="Approved Vendor",
@@ -536,17 +585,13 @@ async def create_transaction(
         lot_vendor = item.supplier or "Approved Vendor"
         lot_price = item.price or 0.0
     else:
-        # --- EXISTING ITEM PATH ---
         item = db.query(models.Item).filter(models.Item.id == int(item_id)).first()
         if not item:
             return HTMLResponse("<script>alert('Item not found.'); window.location='/';</script>")
-        # Lock UOM: only set if not already set; once set, it stays fixed
         if not item.uom:
             item.uom = uom
         uom = item.uom
 
-        # Vendor + price are NO LONGER entered here — they come from the admin's
-        # procurement pricing. Use the oldest placed order for this item.
         placed_orders = db.query(models.ProcurementRequest).filter(
             models.ProcurementRequest.item_id == item.id,
             models.ProcurementRequest.status == "Order Placed"
@@ -562,14 +607,35 @@ async def create_transaction(
         else:
             lot_price = item.price or 0.0
 
-        # Reflect this receipt as the item's last-known (previous) vendor/price
         item.supplier = lot_vendor
         item.price = lot_price
 
-    add_to_lot(db, item, lot_vendor, lot_price, quantity)
+    # --- SERIAL-TRACKED PATH (Fixed Assets and Equipments) ---
+    serial_list = []
+    if is_tracked(item):
+        raw = (serial_numbers or "").replace(",", "\n")
+        serial_list = [s.strip() for s in raw.split("\n") if s.strip()]
+        if not serial_list:
+            return HTMLResponse("<script>alert('Serial number(s) are required for Fixed Assets and Equipments. Enter one serial per line.'); window.history.back();</script>")
+        if quantity != len(serial_list):
+            return HTMLResponse(f"<script>alert('Quantity ({quantity}) must equal the number of serials provided ({len(serial_list)}).'); window.history.back();</script>")
+        if len(set(serial_list)) != len(serial_list):
+            return HTMLResponse("<script>alert('Duplicate serials within this entry. Each serial must be unique.'); window.history.back();</script>")
+        existing_serials = {row[0] for row in db.query(models.AssetUnit.serial_no).filter(
+            models.AssetUnit.serial_no.in_(serial_list)
+        ).all()}
+        dup = [s for s in serial_list if s in existing_serials]
+        if dup:
+            return HTMLResponse(f"<script>alert('These serial numbers already exist: {', '.join(dup[:5])}'); window.history.back();</script>")
+        now = _dt.datetime.utcnow()
+        for s in serial_list:
+            db.add(models.AssetUnit(item_id=item.id, serial_no=s, status="In Stock", acquired_at=now))
+        item.current_stock = (item.current_stock or 0) + len(serial_list)
+    else:
+        add_to_lot(db, item, lot_vendor, lot_price, quantity)
+
     item_unit_price = lot_price
 
-    # current_user is Received By
     received_by_name = current_user.full_name or current_user.username
 
     safe_filename = f"GRN_{item.item_code}_{timestamp_str}_{grn_file.filename.replace(' ', '_')}"
@@ -740,8 +806,8 @@ def grn_list(current_user: models.User = Depends(get_current_user), db: Session 
     grns = db.query(models.GRNRecord).order_by(models.GRNRecord.timestamp.desc()).all()
     rows = ""
     for g in grns:
-        ts = g.timestamp.strftime("%d-%m-%Y %H:%M") if g.timestamp else ""
-        ts_iso = g.timestamp.strftime("%Y-%m-%d") if g.timestamp else ""
+        ts = fmt_ist(g.timestamp)
+        ts_iso = fmt_ist(g.timestamp, "%Y-%m-%d")
         item_name = g.item.name if g.item else "Unknown Item"
         item_code = g.item.item_code if g.item else "—"
         uploader = g.uploader.username if g.uploader else "System"
@@ -971,8 +1037,8 @@ def mis_list(current_user: models.User = Depends(get_current_user), db: Session 
     ).order_by(models.MaterialAssignment.timestamp.desc()).all()
     rows = ""
     for a in assignments:
-        ts = a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else ""
-        ts_iso = a.timestamp.strftime("%Y-%m-%d") if a.timestamp else ""
+        ts = fmt_ist(a.timestamp)
+        ts_iso = fmt_ist(a.timestamp, "%Y-%m-%d")
         item_name = a.item.name if a.item else "Unknown Item"
         item_code = a.item.item_code if a.item else "—"
         dept = getattr(a, 'department', '—') or '—'
@@ -1201,8 +1267,8 @@ def rts_list(current_user: models.User = Depends(get_current_user), db: Session 
     ).order_by(models.MaterialAssignment.timestamp.desc()).all()
     rows = ""
     for a in returns:
-        ts = a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else ""
-        ts_iso = a.timestamp.strftime("%Y-%m-%d") if a.timestamp else ""
+        ts = fmt_ist(a.timestamp)
+        ts_iso = fmt_ist(a.timestamp, "%Y-%m-%d")
         item_name = a.item.name if a.item else "Unknown Item"
         item_code = a.item.item_code if a.item else "—"
         returned_by = a.issued_to or "—"
@@ -1654,6 +1720,7 @@ async def issue_materials(
     issued_by: str = Form(None),
     department: str = Form("General Operations"),
     remarks: str = Form(None),
+    asset_unit_id: int = Form(None),     # required when issuing a Fixed Asset / Equipment unit
     mis_file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
@@ -1661,19 +1728,34 @@ async def issue_materials(
     if not current_user:
         return RedirectResponse(url="/login", status_code=303)
 
-    # "Issued By" is the logged-in user recording the issue, not a form field
     if not issued_by:
         issued_by = current_user.full_name or current_user.username
 
-    # MIS upload is mandatory to proceed
     if not mis_file or not mis_file.filename:
         return HTMLResponse("<script>alert('MIS (Material Issue Slip) upload is mandatory before recording an issue.'); window.history.back();</script>")
 
     item = db.query(models.Item).filter(models.Item.id == item_id).first()
-    if not item or item.current_stock < quantity:
-        return RedirectResponse(url="/?error=insufficient_stock", status_code=303)
+    if not item:
+        return RedirectResponse(url="/?error=item_not_found", status_code=303)
 
-    # Save MIS file to disk
+    tracked = is_tracked(item)
+    asset_unit = None
+    if tracked:
+        if not asset_unit_id:
+            return HTMLResponse("<script>alert('Select a specific serial number to issue this Fixed Asset / Equipment.'); window.history.back();</script>")
+        asset_unit = db.query(models.AssetUnit).filter(
+            models.AssetUnit.id == asset_unit_id,
+            models.AssetUnit.item_id == item_id
+        ).first()
+        if not asset_unit:
+            return HTMLResponse("<script>alert('Selected asset unit not found.'); window.history.back();</script>")
+        if asset_unit.status != "In Stock":
+            return HTMLResponse(f"<script>alert('Serial {asset_unit.serial_no} is currently {asset_unit.status}, not In Stock. Refresh and re-select.'); window.history.back();</script>")
+        quantity = 1
+    else:
+        if (item.current_stock or 0) < quantity:
+            return RedirectResponse(url="/?error=insufficient_stock", status_code=303)
+
     import os, datetime as dt
     mis_dir = "mis_uploads"
     os.makedirs(mis_dir, exist_ok=True)
@@ -1684,7 +1766,11 @@ async def issue_materials(
     with open(mis_path, "wb") as f:
         f.write(contents)
 
-    fifo_cost = consume_fifo(db, item, quantity)
+    if tracked:
+        fifo_cost = float(item.price or 0.0)
+        item.current_stock = (item.current_stock or 0) - 1
+    else:
+        fifo_cost = consume_fifo(db, item, quantity)
 
     now = dt.datetime.utcnow()
     new_assignment = models.MaterialAssignment(
@@ -1700,11 +1786,17 @@ async def issue_materials(
         mis_filedata=contents,
         mis_uploaded_by_id=current_user.id,
         mis_upload_timestamp=now,
-        timestamp=now
+        timestamp=now,
+        asset_unit_id=(asset_unit.id if tracked else None),
     )
     db.add(new_assignment)
+    db.flush()
 
-    # Record outward transaction for the flow dashboard
+    if tracked:
+        asset_unit.status = "Issued"
+        asset_unit.current_holder = issued_to
+        asset_unit.current_assignment_id = new_assignment.id
+
     db.add(models.Transaction(
         item_id=item_id,
         type="OUT",
@@ -1725,16 +1817,17 @@ async def return_to_store(
     returned_by: str = Form(...),               # the employee returning the material
     department: str = Form("General Operations"),
     remarks: str = Form(None),
+    asset_unit_id: int = Form(None),            # for tracked items: which serial is coming back
     return_file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    """Record a return-to-store: adds quantity back to inventory and logs
-    it as a Return row on material_assignments (is_return=True)."""
+    """Record a return-to-store. For consumables/tools this adds quantity back via a
+    return lot; for Fixed Assets and Equipments it flips the specific AssetUnit
+    back to In Stock."""
     if not current_user:
         return RedirectResponse(url="/login", status_code=303)
 
-    # Return slip mandatory
     if not return_file or not return_file.filename:
         return HTMLResponse("<script>alert('Return-to-Store Slip is mandatory before recording a return.'); window.history.back();</script>")
 
@@ -1745,22 +1838,37 @@ async def return_to_store(
     if not item:
         return HTMLResponse("<script>alert('Item not found.'); window.history.back();</script>")
 
-    # Net issued to this employee = sum issues - sum prior returns
-    issued_total = db.query(models.MaterialAssignment).filter(
-        models.MaterialAssignment.item_id == item_id,
-        models.MaterialAssignment.issued_to == returned_by,
-        (models.MaterialAssignment.is_return == False) | (models.MaterialAssignment.is_return.is_(None))
-    ).all()
-    returned_total = db.query(models.MaterialAssignment).filter(
-        models.MaterialAssignment.item_id == item_id,
-        models.MaterialAssignment.issued_to == returned_by,
-        models.MaterialAssignment.is_return == True
-    ).all()
-    net_held = sum(a.quantity or 0 for a in issued_total) - sum(a.quantity or 0 for a in returned_total)
-    if quantity > net_held:
-        return HTMLResponse(f"<script>alert('Cannot return {quantity} units. {returned_by} currently holds only {net_held}.'); window.history.back();</script>")
+    tracked = is_tracked(item)
+    asset_unit = None
 
-    # Save Return slip to disk + DB
+    if tracked:
+        if not asset_unit_id:
+            return HTMLResponse("<script>alert('Select the specific serial number being returned.'); window.history.back();</script>")
+        asset_unit = db.query(models.AssetUnit).filter(
+            models.AssetUnit.id == asset_unit_id,
+            models.AssetUnit.item_id == item_id
+        ).first()
+        if not asset_unit:
+            return HTMLResponse("<script>alert('Selected asset unit not found.'); window.history.back();</script>")
+        if asset_unit.status != "Issued" or asset_unit.current_holder != returned_by:
+            return HTMLResponse(f"<script>alert('Serial {asset_unit.serial_no} is not currently held by {returned_by}.'); window.history.back();</script>")
+        quantity = 1
+    else:
+        # Net issued to this employee = sum issues - sum prior returns
+        issued_total = db.query(models.MaterialAssignment).filter(
+            models.MaterialAssignment.item_id == item_id,
+            models.MaterialAssignment.issued_to == returned_by,
+            (models.MaterialAssignment.is_return == False) | (models.MaterialAssignment.is_return.is_(None))
+        ).all()
+        returned_total = db.query(models.MaterialAssignment).filter(
+            models.MaterialAssignment.item_id == item_id,
+            models.MaterialAssignment.issued_to == returned_by,
+            models.MaterialAssignment.is_return == True
+        ).all()
+        net_held = sum(a.quantity or 0 for a in issued_total) - sum(a.quantity or 0 for a in returned_total)
+        if quantity > net_held:
+            return HTMLResponse(f"<script>alert('Cannot return {quantity} units. {returned_by} currently holds only {net_held}.'); window.history.back();</script>")
+
     import os, datetime as dt
     rts_dir = "rts_uploads"
     os.makedirs(rts_dir, exist_ok=True)
@@ -1771,18 +1879,22 @@ async def return_to_store(
     with open(rts_path, "wb") as f:
         f.write(contents)
 
-    # Add returned quantity back to inventory as a clearly-labelled return lot
-    # (price 0 — the units were already paid for through the original purchase)
-    return_vendor = f"Returned by {returned_by}"
-    add_to_lot(db, item, return_vendor, 0.0, quantity)
+    if tracked:
+        asset_unit.status = "In Stock"
+        asset_unit.current_holder = None
+        asset_unit.current_assignment_id = None
+        item.current_stock = (item.current_stock or 0) + 1
+    else:
+        return_vendor = f"Returned by {returned_by}"
+        add_to_lot(db, item, return_vendor, 0.0, quantity)
 
     now = dt.datetime.utcnow()
     db.add(models.MaterialAssignment(
         item_id=item_id,
         quantity=quantity,
         uom=item.uom or "Nos",
-        issued_to=returned_by,                                      # the employee who held the item
-        issued_by=current_user.full_name or current_user.username,  # the store user recording the return
+        issued_to=returned_by,
+        issued_by=current_user.full_name or current_user.username,
         department=department,
         remarks=remarks,
         custodian=returned_by,
@@ -1791,10 +1903,10 @@ async def return_to_store(
         return_filedata=contents,
         mis_uploaded_by_id=current_user.id,
         mis_upload_timestamp=now,
-        timestamp=now
+        timestamp=now,
+        asset_unit_id=(asset_unit.id if tracked else None),
     ))
 
-    # Mirror as an IN-flavour transaction in the ledger (type RETURN)
     db.add(models.Transaction(
         item_id=item_id,
         type="RETURN",
@@ -1806,6 +1918,7 @@ async def return_to_store(
 
     db.commit()
     return RedirectResponse(url="/?tab=allocations", status_code=303)
+@app.post("/procurement/request")
 def create_procurement_request(
     item_id: str = Form(...),
     quantity: int = Form(...),
@@ -2072,7 +2185,7 @@ def procurement_export_excel(
     }
 
     for ri, r in enumerate(reqs, 2):
-        date_str = r.timestamp.strftime("%d-%m-%Y %H:%M") if r.timestamp else ""
+        date_str = fmt_ist(r.timestamp)
         if getattr(r, 'is_new_item', False):
             raw_name = r.new_item_name or ""
             if raw_name.startswith("[CODE:"):
@@ -2728,17 +2841,46 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
     items = db.query(models.Item).order_by(models.Item.name).all()
     employees = db.query(models.Employee).order_by(models.Employee.name).all()
     import json as _json, html as _html
-    inv_json = _json.dumps([{"id": i.id, "name": i.name, "code": i.item_code, "stock": i.current_stock,
-        "uom": getattr(i,'uom',None) or "", "price": i.price or 0.0, "vendor": getattr(i,'supplier','') or "",
-        "category": getattr(i, 'category', None) or DEFAULT_ASSET_CLASS} for i in items])
+    inv_json = _json.dumps([{
+        "id": i.id, "name": i.name, "code": i.item_code, "stock": i.current_stock,
+        "uom": getattr(i,'uom',None) or "", "price": i.price or 0.0,
+        "vendor": getattr(i,'supplier','') or "",
+        "category": getattr(i, 'category', None) or DEFAULT_ASSET_CLASS,
+        "tracked": is_tracked(i),
+    } for i in items])
 
-    # Build map: {employee_name: [{item_id, name, code, uom, qty_held}]}
-    # qty_held = sum(issues) - sum(prior returns) for that (item, employee)
     item_by_id = {i.id: i for i in items}
-    held = {}  # (emp, item_id) -> qty
+
+    # Tracked items: in-stock asset units for the Outward serial picker
+    in_stock_units = {}
+    for u in db.query(models.AssetUnit).filter(models.AssetUnit.status == "In Stock").all():
+        in_stock_units.setdefault(u.item_id, []).append({"id": u.id, "serial_no": u.serial_no})
+    units_by_item_json = _json.dumps(in_stock_units)
+
+    # Held units per employee (tracked items only) — for Return picker
+    held_units_map = {}
+    for u in db.query(models.AssetUnit).filter(models.AssetUnit.status == "Issued").all():
+        if not u.current_holder:
+            continue
+        it = item_by_id.get(u.item_id)
+        if not it:
+            continue
+        held_units_map.setdefault(u.current_holder, []).append({
+            "asset_unit_id": u.id, "serial_no": u.serial_no,
+            "item_id": u.item_id, "item_name": it.name, "item_code": it.item_code,
+            "uom": (it.uom or "Nos"),
+            "category": getattr(it, 'category', None) or DEFAULT_ASSET_CLASS,
+        })
+    held_units_json = _json.dumps(held_units_map)
+
+    # Consumable/tools net-held per (employee, item) — skip tracked items (handled above)
+    held = {}
     all_assigns = db.query(models.MaterialAssignment).all()
     for a in all_assigns:
         if not a.issued_to or not a.item_id:
+            continue
+        it = item_by_id.get(a.item_id)
+        if it and is_tracked(it):
             continue
         key = (a.issued_to, a.item_id)
         sign = -1 if getattr(a, "is_return", False) else +1
@@ -2828,6 +2970,20 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
       <div class="bg-indigo-50/60 border border-indigo-100 rounded-lg p-2 text-[11px] text-indigo-700 font-medium">
         <i class="fa-solid fa-user-check mr-1"></i> Received By: <span class="font-black">{recv} ({_html.escape(current_user.username)})</span>
       </div>
+      <div id="inward_serial_block" class="hidden bg-amber-50/40 border border-amber-200/60 rounded-xl p-3">
+        <div class="flex items-center justify-between mb-1">
+          <label class="block font-bold text-amber-700 text-[10px] uppercase tracking-wider">
+            <i class="fa-solid fa-barcode mr-1"></i> Serial Numbers <span class="text-rose-500">*</span>
+          </label>
+          <button type="button" onclick="autoFillSerials()" class="text-[10px] text-amber-700 hover:underline font-bold">Auto-fill</button>
+        </div>
+        <textarea id="inward_serial_numbers" name="serial_numbers" rows="3" placeholder="EIPL-LAP-001&#10;EIPL-LAP-002&#10;..."
+          class="w-full bg-white border border-amber-200 p-2 rounded-lg font-mono text-[11px] focus:outline-none focus:border-amber-500"></textarea>
+        <p class="text-[10px] text-amber-700 mt-1 leading-snug">
+          One serial per line. Required because this item is a <b>Fixed Asset / Equipment</b>.
+          The number of serials must match the Quantity Received.
+        </p>
+      </div>
       <div><label class="block font-semibold text-slate-500 mb-1">Upload GRN <span class="text-rose-500 font-black">*</span></label>
         <input type="file" name="grn_file" required accept=".pdf,.jpg,.jpeg,.png,.xlsx,.xls,.doc,.docx"
           class="w-full bg-rose-50 border border-rose-200 text-slate-700 text-[10px] p-2 rounded-lg">
@@ -2872,6 +3028,15 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
         <label class="block font-semibold text-slate-500 mb-1">Category</label>
         <input type="text" id="mis_category_display" readonly placeholder="\u2014 (auto-filled)"
           class="w-full bg-slate-100 border border-slate-200 p-2 rounded-lg text-xs text-slate-500 cursor-not-allowed">
+      </div>
+      <div id="mis_serial_block" class="hidden bg-amber-50/40 border border-amber-200/60 rounded-xl p-3">
+        <label class="block font-bold text-amber-700 text-[10px] uppercase tracking-wider mb-1">
+          <i class="fa-solid fa-barcode mr-1"></i> Select Serial <span class="text-rose-500">*</span>
+        </label>
+        <select id="mis_asset_unit" name="asset_unit_id" class="w-full bg-white border border-amber-200 p-2 rounded-lg font-mono text-[11px] focus:outline-none focus:border-amber-500">
+          <option value="">-- Select serial in stock --</option>
+        </select>
+        <p class="text-[10px] text-amber-700 mt-1">One physical unit per issue (Fixed Asset / Equipment).</p>
       </div>
       <div class="grid grid-cols-2 gap-2">
         <div><label class="block font-semibold text-slate-500 mb-1">Quantity to Issue</label>
@@ -2940,6 +3105,16 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
         </select>
       </div>
 
+      <div id="rts_serial_block" class="hidden bg-amber-50/40 border border-amber-200/60 rounded-xl p-3">
+        <label class="block font-bold text-amber-700 text-[10px] uppercase tracking-wider mb-1">
+          <i class="fa-solid fa-barcode mr-1"></i> Serial Being Returned <span class="text-rose-500">*</span>
+        </label>
+        <select id="rts_asset_unit" name="asset_unit_id" class="w-full bg-white border border-amber-200 p-2 rounded-lg font-mono text-[11px] focus:outline-none focus:border-amber-500">
+          <option value="">-- Select serial being returned --</option>
+        </select>
+        <p class="text-[10px] text-amber-700 mt-1">One physical unit per return (Fixed Asset / Equipment).</p>
+      </div>
+
       <div class="grid grid-cols-2 gap-2">
         <div>
           <label class="block font-semibold text-slate-500 mb-1">Quantity Returned</label>
@@ -2987,8 +3162,10 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
 </div>
 
 <script id="mm-held" type="application/json">{held_json}</script>
+<script id="mm-held-units" type="application/json">{held_units_json}</script>
 <script>
 var MMHELD = JSON.parse(document.getElementById('mm-held').textContent);
+var MMHELD_UNITS = JSON.parse(document.getElementById('mm-held-units').textContent);
 function onRtsEmployeeChange() {{
     var emp = document.getElementById('rts_employee').value;
     var itemSel = document.getElementById('rts_item');
@@ -2999,28 +3176,61 @@ function onRtsEmployeeChange() {{
     var qtyHelp = document.getElementById('rts_qty_help');
     var uomDisp = document.getElementById('rts_uom_display');
     var catDisp = document.getElementById('rts_category_display');
+    var serialBlock = document.getElementById('rts_serial_block');
+    var serialSel = document.getElementById('rts_asset_unit');
     itemSel.innerHTML = '<option value="">-- Select item --</option>';
     uomDisp.value = ''; qty.value = 1; qty.max = ''; qtyHelp.textContent = 'Max: \u2014';
     if (catDisp) catDisp.value = '';
+    if (serialBlock) {{ serialBlock.classList.add('hidden'); serialSel.required=false; serialSel.value=''; }}
+
     if (!emp) {{
         itemSel.disabled = true; panel.classList.add('hidden'); noBox.classList.add('hidden'); return;
     }}
-    var rows = MMHELD[emp] || [];
-    if (!rows.length) {{
+    var consumRows = MMHELD[emp] || [];
+    var unitRows = MMHELD_UNITS[emp] || [];
+    if (!consumRows.length && !unitRows.length) {{
         itemSel.disabled = true; panel.classList.add('hidden'); noBox.classList.remove('hidden'); return;
     }}
     noBox.classList.add('hidden');
     panel.classList.remove('hidden');
-    listDiv.innerHTML = rows.map(function(r) {{
+
+    var consumDisplay = consumRows.map(function(r) {{
         return '<div class="flex justify-between gap-2 border-b border-amber-100 last:border-0 pb-1">' +
             '<span class="truncate"><b>' + r.name + '</b> <span class="text-slate-400 text-[10px]">(' + r.code + ')</span></span>' +
             '<span class="font-mono text-amber-700 font-bold shrink-0">' + r.qty_held + ' ' + r.uom + '</span></div>';
     }}).join('');
-    rows.forEach(function(r) {{
+    // Group tracked rows by item_id for the held panel + dropdown
+    var byItem = {{}};
+    unitRows.forEach(function(u) {{
+        if (!byItem[u.item_id]) byItem[u.item_id] = {{ name: u.item_name, code: u.item_code, uom: u.uom, category: u.category, serials: [] }};
+        byItem[u.item_id].serials.push({{ id: u.asset_unit_id, sn: u.serial_no }});
+    }});
+    var unitDisplay = Object.keys(byItem).map(function(iid) {{
+        var g = byItem[iid];
+        var serialList = g.serials.map(function(s){{return s.sn;}}).join(', ');
+        return '<div class="border-b border-amber-100 last:border-0 pb-1">' +
+            '<div class="flex justify-between gap-2"><span class="truncate"><b>' + g.name + '</b> <span class="text-slate-400 text-[10px]">(' + g.code + ')</span></span>' +
+            '<span class="font-mono text-amber-700 font-bold shrink-0">' + g.serials.length + ' ' + g.uom + '</span></div>' +
+            '<div class="text-[9px] text-slate-500 font-mono mt-0.5">' + serialList + '</div></div>';
+    }}).join('');
+    listDiv.innerHTML = consumDisplay + unitDisplay;
+
+    consumRows.forEach(function(r) {{
         var opt = document.createElement('option');
         opt.value = r.item_id;
         opt.textContent = r.name + ' (' + r.code + ') \u2014 holding ' + r.qty_held + ' ' + r.uom;
-        opt.dataset.uom = r.uom; opt.dataset.max = r.qty_held; opt.dataset.category = r.category || '';
+        opt.dataset.uom = r.uom; opt.dataset.max = r.qty_held;
+        opt.dataset.category = r.category || ''; opt.dataset.tracked = '0';
+        itemSel.appendChild(opt);
+    }});
+    Object.keys(byItem).forEach(function(iid) {{
+        var g = byItem[iid];
+        var opt = document.createElement('option');
+        opt.value = iid;
+        opt.textContent = g.name + ' (' + g.code + ') \u2014 ' + g.serials.length + ' serial(s) held';
+        opt.dataset.uom = g.uom; opt.dataset.max = g.serials.length;
+        opt.dataset.category = g.category || ''; opt.dataset.tracked = '1';
+        opt.dataset.serials = JSON.stringify(g.serials);
         itemSel.appendChild(opt);
     }});
     itemSel.disabled = false;
@@ -3032,9 +3242,12 @@ function onRtsItemChange() {{
     var qtyHelp = document.getElementById('rts_qty_help');
     var uomDisp = document.getElementById('rts_uom_display');
     var catDisp = document.getElementById('rts_category_display');
+    var serialBlock = document.getElementById('rts_serial_block');
+    var serialSel = document.getElementById('rts_asset_unit');
     if (!opt || !opt.value) {{
         uomDisp.value = ''; qty.max = ''; qtyHelp.textContent = 'Max: \u2014';
         if (catDisp) catDisp.value = '';
+        if (serialBlock) {{ serialBlock.classList.add('hidden'); serialSel.required=false; serialSel.value=''; }}
         return;
     }}
     uomDisp.value = opt.dataset.uom || '';
@@ -3042,19 +3255,66 @@ function onRtsItemChange() {{
     qty.max = opt.dataset.max || '';
     qty.value = 1;
     qtyHelp.textContent = 'Max: ' + (opt.dataset.max || '\u2014') + ' ' + (opt.dataset.uom || '');
+    if (opt.dataset.tracked === '1' && serialBlock) {{
+        var serials = JSON.parse(opt.dataset.serials || '[]');
+        serialSel.innerHTML = '<option value="">-- Select serial being returned --</option>';
+        serials.forEach(function(s) {{
+            var o = document.createElement('option');
+            o.value = s.id; o.textContent = s.sn;
+            serialSel.appendChild(o);
+        }});
+        serialBlock.classList.remove('hidden');
+        serialSel.required = true;
+        qty.value = 1; qty.readOnly = true;
+    }} else if (serialBlock) {{
+        serialBlock.classList.add('hidden');
+        serialSel.required = false; serialSel.value = '';
+        qty.readOnly = false;
+    }}
 }}
 </script>
 
 <script id="mm-inv" type="application/json">{inv_json}</script>
+<script id="mm-units-by-item" type="application/json">{units_by_item_json}</script>
 <script>
 var MMINV = JSON.parse(document.getElementById('mm-inv').textContent);
+var MM_UNITS_BY_ITEM = JSON.parse(document.getElementById('mm-units-by-item').textContent);
 function mkDd(items, cls) {{
     return items.slice(0,10).map(function(i) {{
-        return '<div class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 last:border-0 ' + cls + '" data-id="'+i.id+'" data-name="'+i.name.replace(/"/g,"&quot;")+'" data-code="'+i.code+'" data-stock="'+i.stock+'" data-uom="'+i.uom+'" data-price="'+i.price+'" data-vendor="'+i.vendor+'" data-category="'+(i.category||'')+'">' +
-        '<div class="font-semibold text-xs pointer-events-none">'+i.name+'</div>' +
-        '<div class="text-[10px] text-slate-400 pointer-events-none">'+i.code+' | Stock: '+i.stock+'</div></div>';
+        return '<div class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 last:border-0 ' + cls + '"'
+            + ' data-id="'+i.id+'"'
+            + ' data-name="'+i.name.replace(/"/g,"&quot;")+'"'
+            + ' data-code="'+i.code+'"'
+            + ' data-stock="'+i.stock+'"'
+            + ' data-uom="'+i.uom+'"'
+            + ' data-price="'+i.price+'"'
+            + ' data-vendor="'+i.vendor+'"'
+            + ' data-category="'+(i.category||'')+'"'
+            + ' data-tracked="'+(i.tracked?'1':'0')+'">'
+            + '<div class="font-semibold text-xs pointer-events-none">'+i.name+(i.tracked?'<span class="ml-1 bg-amber-100 text-amber-700 text-[9px] font-bold px-1.5 py-0.5 rounded">TRACKED</span>':'')+'</div>'
+            + '<div class="text-[10px] text-slate-400 pointer-events-none">'+i.code+' | Stock: '+i.stock+'</div></div>';
     }}).join('') || '<div class="p-3 text-slate-400 text-xs">No items found</div>';
 }}
+
+// Auto-fill serial textarea: prompts for prefix + start number, generates N serials.
+function autoFillSerials() {{
+    var qtyInput = document.querySelector('form[action="/transaction"] [name=quantity]');
+    var qty = parseInt((qtyInput && qtyInput.value) || '0', 10);
+    if (qty <= 0) {{ alert('Set Quantity Received first.'); return; }}
+    var codeFallback = document.getElementById('inward_item_search').value.match(/\\(([^)]+)\\)/);
+    codeFallback = codeFallback ? codeFallback[1] : 'EIPL';
+    var prefix = window.prompt('Enter serial prefix (without trailing dash):', codeFallback);
+    if (!prefix) return;
+    var startStr = window.prompt('Starting number (e.g. 1):', '1');
+    var start = parseInt(startStr, 10);
+    if (isNaN(start) || start < 0) return;
+    var lines = [];
+    for (var i = 0; i < qty; i++) {{
+        lines.push(prefix + '-' + String(start + i).padStart(3, '0'));
+    }}
+    document.getElementById('inward_serial_numbers').value = lines.join('\\n');
+}}
+
 function filterInwardItems(q) {{
     var dd=document.getElementById('inward_item_dropdown');
     var m=q ? MMINV.filter(function(i){{return i.name.toLowerCase().includes(q.toLowerCase())||i.code.toLowerCase().includes(q.toLowerCase());}}) : [];
@@ -3072,23 +3332,56 @@ function showMISDropdown(){{filterMISItems(document.getElementById('mis_item_sea
 document.addEventListener('click',function(e){{
     var el=e.target.closest('.inw-item');
     if(el){{
+        var tracked = el.dataset.tracked === '1';
         document.getElementById('inward_item_id').value=el.dataset.id;
         document.getElementById('inward_item_search').value=el.dataset.name+' ('+el.dataset.code+')';
-        document.getElementById('inward_selected_label').textContent='Selected: '+el.dataset.name+' | Stock: '+el.dataset.stock;
+        document.getElementById('inward_selected_label').textContent='Selected: '+el.dataset.name+' | Stock: '+el.dataset.stock+(tracked?' | TRACKED':'');
         document.getElementById('inward_selected_label').className='text-[10px] text-indigo-600 font-semibold mt-1';
         document.getElementById('inward_item_dropdown').classList.add('hidden');
         if(el.dataset.uom)document.getElementById('inward_uom_select').value=el.dataset.uom;
         if(document.getElementById('inward_category_display'))document.getElementById('inward_category_display').value=el.dataset.category||'';
+        // Show/hide Serial Numbers block based on tracking
+        var sb = document.getElementById('inward_serial_block');
+        var ta = document.getElementById('inward_serial_numbers');
+        if (tracked) {{
+            sb.classList.remove('hidden');
+            ta.required = true;
+        }} else {{
+            sb.classList.add('hidden');
+            ta.value = '';
+            ta.required = false;
+        }}
         return;
     }}
     var el2=e.target.closest('.mis-item');
     if(el2){{
+        var tracked2 = el2.dataset.tracked === '1';
         document.getElementById('mis_item_id').value=el2.dataset.id;
         document.getElementById('mis_item_search').value=el2.dataset.name+' ('+el2.dataset.code+')';
-        document.getElementById('mis_selected_label').textContent='Selected: '+el2.dataset.name+' | Stock: '+el2.dataset.stock;
+        document.getElementById('mis_selected_label').textContent='Selected: '+el2.dataset.name+' | Stock: '+el2.dataset.stock+(tracked2?' | TRACKED':'');
         document.getElementById('mis_uom_display').value=el2.dataset.uom||'';
         if(document.getElementById('mis_category_display'))document.getElementById('mis_category_display').value=el2.dataset.category||'';
         document.getElementById('mis_item_dropdown').classList.add('hidden');
+        // Show/hide MIS serial picker
+        var sblk = document.getElementById('mis_serial_block');
+        var sel = document.getElementById('mis_asset_unit');
+        var misQty = document.querySelector('form[action="/material/issue"] [name=quantity]');
+        if (tracked2) {{
+            sblk.classList.remove('hidden');
+            sel.required = true;
+            sel.innerHTML = '<option value="">-- Select serial in stock --</option>';
+            var units = MM_UNITS_BY_ITEM[el2.dataset.id] || [];
+            units.forEach(function(u) {{
+                var opt = document.createElement('option');
+                opt.value = u.id; opt.textContent = u.serial_no;
+                sel.appendChild(opt);
+            }});
+            if (misQty) {{ misQty.value = 1; misQty.readOnly = true; }}
+        }} else {{
+            sblk.classList.add('hidden');
+            sel.required = false; sel.value = '';
+            if (misQty) {{ misQty.readOnly = false; }}
+        }}
         return;
     }}
     if(document.getElementById('inward_item_dropdown')&&!document.getElementById('inward_item_dropdown').contains(e.target)&&e.target.id!=='inward_item_search')document.getElementById('inward_item_dropdown').classList.add('hidden');
@@ -3113,6 +3406,17 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
     # Per-item transaction logs for the merged log column / modal
     import json as _json_txn
     txn_logs = build_txn_logs(db, items)
+
+    # Per-item asset register for the Serials modal (tracked items)
+    asset_register = {}
+    for u in db.query(models.AssetUnit).order_by(models.AssetUnit.acquired_at.asc()).all():
+        asset_register.setdefault(u.item_id, []).append({
+            "serial_no": u.serial_no or "—",
+            "status": u.status or "In Stock",
+            "current_holder": u.current_holder or "",
+            "acquired_at": fmt_ist(u.acquired_at, "%d-%m-%Y"),
+            "notes": u.notes or "",
+        })
 
     item_options = "".join([f'<option value="{i.id}">{i.name} ({i.item_code})</option>' for i in items])
     employee_options = "".join([f'<option value="{e.name}">{e.name} - {e.role_title}</option>' for e in employees])
@@ -3310,14 +3614,21 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             <td class="p-3 font-mono text-slate-400" data-sort="{it.minimum_stock}">{it.minimum_stock}</td>
             {action_cell}
             <td class="p-3 text-center">
-                <button type="button"
-                    onclick="openTxnLog({it.id}, '{h_name}', '{h_code}')"
-                    class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all inline-flex items-center gap-1">
-                    <i class="fa-solid fa-book-open text-[9px]"></i> Log
-                </button>
+                <div class="flex items-center justify-center gap-1 flex-wrap">
+                    <button type="button"
+                        onclick="openTxnLog({it.id}, '{h_name}', '{h_code}')"
+                        class="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all inline-flex items-center gap-1">
+                        <i class="fa-solid fa-book-open text-[9px]"></i> Log
+                    </button>
+                    {f'''<button type="button"
+                        onclick="openAssetRegister({it.id}, '{h_name}', '{h_code}')"
+                        class="bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 font-bold text-[10px] px-2.5 py-1.5 rounded-lg transition-all inline-flex items-center gap-1">
+                        <i class="fa-solid fa-barcode text-[9px]"></i> Serials
+                    </button>''' if is_tracked(it) else ''}
+                </div>
             </td>
         </tr>
-        <script>window.__txnData = window.__txnData||{{}};window.__txnData[{it.id}]={_json_txn.dumps(txn_logs.get(it.id, []))};</script>
+        <script>window.__txnData = window.__txnData||{{}};window.__txnData[{it.id}]={_json_txn.dumps(txn_logs.get(it.id, []))};window.__assetData = window.__assetData||{{}};window.__assetData[{it.id}]={_json_txn.dumps(asset_register.get(it.id, []))};</script>
         """
 
         # Multi-vendor / multi-price lot breakdown — hidden by default, toggled via "vendors" link.
@@ -3356,7 +3667,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
     is_admin = current_user.role == "Admin"
 
     for r in reqs:
-        date_str = r.timestamp.strftime("%d-%m %H:%M") if r.timestamp else ""
+        date_str = fmt_ist(r.timestamp, "%d-%m %H:%M")
 
         # Status badge
         status_badge_map = {
@@ -3486,7 +3797,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             sender_label = "Admin" if sender_role == "Admin" else (msg.sender.username if msg.sender else "Staff")
             bubble_color = "bg-indigo-50 border-indigo-100 text-indigo-900" if sender_role == "Admin" else "bg-slate-50 border-slate-200 text-slate-800"
             label_color = "text-indigo-600" if sender_role == "Admin" else "text-slate-500"
-            msg_time = msg.timestamp.strftime("%d-%m %H:%M") if msg.timestamp else ""
+            msg_time = fmt_ist(msg.timestamp, "%d-%m %H:%M")
             safe_msg = _html.escape(msg.message)
             msg_bubbles += f"""<div class='border rounded-lg p-2 {bubble_color} mb-1'>
                 <div class='flex justify-between items-center mb-0.5'>
@@ -3510,7 +3821,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         # Category: falls back to the linked item's category, then default
         req_category = getattr(r, 'category', None) or (getattr(r.item, 'category', None) if r.item else None) or DEFAULT_ASSET_CLASS
 
-        req_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs align-middle" data-row="1" data-date="{r.timestamp.strftime('%Y-%m-%d') if r.timestamp else ''}" data-text="{date_str} {r.requester.username if r.requester else ''} {r.status} {r.department or ''}">
+        req_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs align-middle" data-row="1" data-date="{fmt_ist(r.timestamp, '%Y-%m-%d')}" data-text="{date_str} {r.requester.username if r.requester else ''} {r.status} {r.department or ''}">
             <td class="p-3 text-slate-500 font-mono whitespace-nowrap text-center">{date_str}</td>
             <td class="p-3 text-slate-800 text-center">{item_desc_display}</td>
             <td class="p-3 font-mono font-semibold text-center">{r.quantity}</td>
@@ -3527,7 +3838,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
 
     assigned_rows = ""
     for a in assignments:
-        ts = a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "—"
+        ts = fmt_ist(a.timestamp) or "—"
         item_name = a.item.name if a.item else 'Archived Asset'
         item_category = getattr(a.item, 'category', None) or DEFAULT_ASSET_CLASS if a.item else DEFAULT_ASSET_CLASS
         dept = getattr(a, 'department', '—') or '—'
