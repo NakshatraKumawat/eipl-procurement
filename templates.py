@@ -50,6 +50,33 @@ LOGIN_HTML = """<!DOCTYPE html>
                 SUBMIT
             </button>
         </form>
+        <div class="text-center mt-4">
+            <button type="button" onclick="document.getElementById('forgotPwdModal').style.display='flex'"
+                class="text-indigo-600 hover:text-indigo-700 text-xs font-semibold hover:underline">
+                Forgot password?
+            </button>
+        </div>
+    </div>
+
+    <div id="forgotPwdModal" style="display:none;" class="fixed inset-0 bg-slate-900/50 backdrop-blur-sm items-center justify-center z-50">
+        <div class="bg-white rounded-2xl shadow-xl max-w-sm w-full mx-4 p-6 border border-slate-200">
+            <div class="text-center">
+                <div class="w-12 h-12 mx-auto bg-indigo-50 rounded-full flex items-center justify-center mb-3">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-indigo-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 11c0-1.657 1.343-3 3-3s3 1.343 3 3-1.343 3-3 3m-6 4h.01M3 12a9 9 0 1118 0 9 9 0 01-18 0z"/></svg>
+                </div>
+                <h3 class="text-base font-bold text-slate-900 mb-2">Password Reset</h3>
+                <p class="text-xs text-slate-600 leading-relaxed mb-4">
+                    For security, passwords can only be reset by an <b>administrator</b>.
+                    Please contact your EIPL admin and provide your User ID. The admin can issue
+                    you a new temporary password from the Grant User Access panel, which you can
+                    change after signing in.
+                </p>
+                <button type="button" onclick="document.getElementById('forgotPwdModal').style.display='none'"
+                    class="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-2.5 rounded-xl font-semibold text-xs">
+                    Got it
+                </button>
+            </div>
+        </div>
     </div>
 </body>
 </html>"""
@@ -74,7 +101,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
 </head>
 <body class="bg-slate-50 text-slate-800 min-h-screen flex">
 
-    <aside class="w-64 bg-white border-r border-slate-200 flex flex-col shrink-0 shadow-sm z-20">
+    <aside class="w-64 bg-white border-r border-slate-200 flex flex-col shrink-0 shadow-sm z-20 sticky top-0 h-screen">
         <div class="p-5 border-b border-slate-100 text-center">
             <img src="/static/logo.png" alt="EIPL Logo"
                 class="h-20 mx-auto mb-2 object-contain"
@@ -160,13 +187,9 @@ LAYOUT_HTML = """<!DOCTYPE html>
 
         <div class="flex-1 p-6 space-y-6 overflow-y-auto max-w-[1650px] w-full mx-auto">
             
-            <div id="tab-viewport-inventory" class="grid grid-cols-1 xl:grid-cols-4 gap-6 items-start">
-                
-                <div class="xl:col-span-1 space-y-6">
-                    __ADMIN_PANEL__
-                </div>
-
-                <div class="xl:col-span-3">
+            <div id="tab-viewport-inventory" class="grid grid-cols-1 gap-6 items-start">
+                __ADMIN_PANEL__
+                <div>
                     <div id="inventory-table-container" class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
                         <div class="p-5 border-b border-slate-100 bg-white flex flex-wrap items-center justify-between gap-3">
                             <div>
@@ -195,10 +218,11 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                     <tr class="bg-slate-50 text-slate-500 font-semibold tracking-wider uppercase border-b border-slate-200">
                                         <th class="p-4 pl-5 cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',0)">Item Name <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',1)">Item Code <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                        <th class="p-4 admin-only-col text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',2)">Previous Vendor <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                        <th class="p-4 admin-only-col text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',3)">Previous Price <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',4)">Current Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',5)">Safety Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',2)">Category <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 admin-only-col text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',3)">Previous Vendor <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 admin-only-col text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',4)">Previous Price <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',5)">Current Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',6)">Safety Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 text-right pr-5">Actions</th>
                                         <th class="p-4 text-center">Transaction Log</th>
                                     </tr>
@@ -282,10 +306,16 @@ LAYOUT_HTML = """<!DOCTYPE html>
                         </div>
 
                         <!-- Ad-hoc fields: shown only when NEW is selected -->
-                        <div id="adhoc_procurement_fields_group" class="grid grid-cols-2 gap-3 mb-3 bg-amber-50/40 p-3 border border-amber-200/50 rounded-xl">
+                        <div id="adhoc_procurement_fields_group" class="grid grid-cols-3 gap-3 mb-3 bg-amber-50/40 p-3 border border-amber-200/50 rounded-xl">
                             <div>
                                 <label class="block font-bold text-amber-800 mb-1">New Item Name <span class="text-rose-500">*</span></label>
                                 <input type="text" id="new_item_name_input" name="new_item_name" placeholder="Enter custom item name" class="w-full bg-white border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm">
+                            </div>
+                            <div>
+                                <label class="block font-bold text-amber-800 mb-1">Category <span class="text-rose-500">*</span></label>
+                                <select id="procurement_category_input" name="category" class="w-full bg-white border border-slate-200 text-slate-900 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 shadow-sm">
+                                    __ASSET_CLASS_OPTIONS__
+                                </select>
                             </div>
                             <div>
                                 <label class="block font-bold text-amber-800 mb-1">Detailed Specification <span class="text-rose-500">*</span></label>
@@ -367,6 +397,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                     __EST_VALUE_HEADER__
                                     <th class="p-3 text-center">Item Code</th>
                                     <th class="p-3 text-center">Specification</th>
+                                    <th class="p-3 text-center">Category</th>
                                     <th class="p-3 text-center whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable('req',6)">Requested By <i class="fa-solid fa-sort text-[9px]"></i></th>
                                     <th class="p-3 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',7)">Status <i class="fa-solid fa-sort text-[9px]"></i></th>
                                     <th class="p-3 text-center">Communication</th>
@@ -418,6 +449,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                         <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortTable('alloc',1)">Item Name <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('alloc',2)">Quantity <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 text-center">UOM</th>
+                                        <th class="p-4 text-center">Category</th>
                                         <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortTable('alloc',4)">Issued To <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortTable('alloc',5)">Department <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 pr-5">Remarks</th>
@@ -509,7 +541,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
             } else if (action === 'create-indent') {
                 prefillIndentForItem(d.id, d.name, d.code, d.uom, d.dept);
             } else if (action === 'edit-item') {
-                openEditItemModal(d.id, d.name, d.code, d.price, d.stock, d.minstock, d.supplier, d.site);
+                openEditItemModal(d.id, d.name, d.code, d.price, d.stock, d.minstock, d.supplier, d.site, d.category);
             } else if (action === 'edit-request') {
                 openEditRequestModal(d.id, d.qty, d.dept, d.itemid);
             } else if (action === 'print-po') {
@@ -982,7 +1014,9 @@ LAYOUT_HTML = """<!DOCTYPE html>
         function closeEditItemModal() { document.getElementById('editItemModal').style.display = 'none'; }
         function closeEditRequestModal() { document.getElementById('editRequestModal').style.display = 'none'; }
 
-        function openEditItemModal(id, name, code, price, stock, minStock, supplier, site) {
+        var ASSET_CLASS_OPTIONS = __ASSET_CLASS_OPTIONS_JSON__;
+
+        function openEditItemModal(id, name, code, price, stock, minStock, supplier, site, category) {
     var modalHtml = `
         <h3 class="text-xs font-bold uppercase text-slate-900 tracking-wider border-b border-slate-100 pb-3">&#9998; Modify Master Inventory Item</h3>
         <form action="/items/edit/${id}" method="POST" class="space-y-4 text-xs text-slate-700">
@@ -1031,6 +1065,14 @@ LAYOUT_HTML = """<!DOCTYPE html>
                         class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white"
                         placeholder="e.g. Store Yard">
                 </div>
+            </div>
+            <div>
+                <label class="block font-semibold text-slate-600 mb-1.5">Category</label>
+                <select name="category" class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl focus:outline-none focus:border-indigo-600 focus:bg-white text-slate-900">
+                    ${ASSET_CLASS_OPTIONS.map(function(c) {
+                        return '<option value="' + c + '"' + (c === category ? ' selected' : '') + '>' + c + '</option>';
+                    }).join('')}
+                </select>
             </div>
             <div class="flex gap-3 pt-2 border-t border-slate-100">
                 <button type="button" onclick="closeEditItemModal()"
@@ -1157,7 +1199,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
         function downloadInventoryExcel() {
             // Build CSV matching exact table headers and data
             var isAdmin = __IS_ADMIN__;
-            var headers = ['Item Name', 'Item Code'];
+            var headers = ['Item Name', 'Item Code', 'Category'];
             if (isAdmin) { headers.push('Vendor / Supplier', 'Price (INR)'); }
             headers.push('Current Stock', 'Safety Stock');
 
@@ -1173,20 +1215,22 @@ LAYOUT_HTML = """<!DOCTYPE html>
                     rowData.push(nameCell);
                     // Item Code
                     rowData.push(cells[1] ? cells[1].innerText.trim() : '');
+                    // Category
+                    rowData.push(cells[2] ? cells[2].innerText.trim() : '');
                     if (isAdmin) {
                         // Vendor
-                        rowData.push(cells[2] ? cells[2].innerText.trim() : '');
-                        // Price — strip ₹ and commas
-                        rowData.push(cells[3] ? cells[3].innerText.replace(/[₹,]/g,'').trim() : '');
-                        // Current Stock
-                        rowData.push(cells[4] ? cells[4].innerText.trim() : '');
-                        // Safety Stock
-                        rowData.push(cells[5] ? cells[5].innerText.trim() : '');
-                    } else {
-                        // Current Stock (col 2 for staff view)
-                        rowData.push(cells[2] ? cells[2].innerText.trim() : '');
-                        // Safety Stock
                         rowData.push(cells[3] ? cells[3].innerText.trim() : '');
+                        // Price — strip ₹ and commas
+                        rowData.push(cells[4] ? cells[4].innerText.replace(/[₹,]/g,'').trim() : '');
+                        // Current Stock
+                        rowData.push(cells[5] ? cells[5].innerText.trim() : '');
+                        // Safety Stock
+                        rowData.push(cells[6] ? cells[6].innerText.trim() : '');
+                    } else {
+                        // Current Stock (col 3 for staff view)
+                        rowData.push(cells[3] ? cells[3].innerText.trim() : '');
+                        // Safety Stock
+                        rowData.push(cells[4] ? cells[4].innerText.trim() : '');
                     }
                     rows.push(rowData);
                 });

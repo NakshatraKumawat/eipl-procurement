@@ -222,6 +222,24 @@ def build_txn_logs(db: Session, items):
 
 app = FastAPI(title="EIPL Enterprise Procurement Framework")
 
+# -------------------------------------------------------------
+# ASSET CLASS CATEGORIES
+# -------------------------------------------------------------
+ASSET_CLASSES = ["Fixed Assets and Equipments", "Consumables", "Tools and Tackles"]
+DEFAULT_ASSET_CLASS = "Consumables"
+
+
+def category_options_html(selected=None):
+    """Return <option> tags for the asset class dropdown, marking `selected`."""
+    sel = selected if selected in ASSET_CLASSES else None
+    opts = ""
+    for c in ASSET_CLASSES:
+        is_sel = " selected" if (sel == c) else ""
+        opts += f'<option value="{c}"{is_sel}>{c}</option>'
+    return opts
+
+
+
 # Serve static assets (company logo etc.) from ./static folder
 import os as _os
 from fastapi.staticfiles import StaticFiles
@@ -379,6 +397,15 @@ def run_structural_database_migrations():
                 pass
             try:
                 _ddl_conn.execute(text(f"ALTER TABLE material_assignments ADD COLUMN return_filedata {_blob_type}"))
+            except Exception:
+                pass
+            # --- ASSET CLASS CATEGORY columns ---
+            try:
+                _ddl_conn.execute(text(f"ALTER TABLE items ADD COLUMN category TEXT DEFAULT '{DEFAULT_ASSET_CLASS}'"))
+            except Exception:
+                pass
+            try:
+                _ddl_conn.execute(text("ALTER TABLE procurement_requests ADD COLUMN category TEXT"))
             except Exception:
                 pass
             _ddl_conn.commit()
@@ -746,7 +773,9 @@ def grn_list(current_user: models.User = Depends(get_current_user), db: Session 
 <style>body{{font-family:'Inter',sans-serif;}}.filter-input{{font-size:11px;padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;background:#f8fafc;width:100%;box-sizing:border-box;}}
 .filter-input:focus{{outline:none;border-color:#6366f1;background:#fff;}}</style>
 </head>
-<body class="bg-slate-50 min-h-screen p-6">
+<body class="bg-slate-50 min-h-screen flex">
+{build_sidebar(current_user, current_page='grn')}
+<div class="flex-1 min-h-screen overflow-x-hidden p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex items-center justify-between mb-5">
             <div>
@@ -902,6 +931,7 @@ function exportGRN() {{
 }}
 window.onload = function() {{ renderGRNPage(); }};
 </script>
+</div>
 </body></html>"""
     return HTMLResponse(html)
 
@@ -971,7 +1001,9 @@ def mis_list(current_user: models.User = Depends(get_current_user), db: Session 
 <style>body{{font-family:'Inter',sans-serif;}}.filter-input{{font-size:11px;padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;background:#f8fafc;width:100%;box-sizing:border-box;}}
 .filter-input:focus{{outline:none;border-color:#6366f1;background:#fff;}}</style>
 </head>
-<body class="bg-slate-50 min-h-screen p-6">
+<body class="bg-slate-50 min-h-screen flex">
+{build_sidebar(current_user, current_page='mis')}
+<div class="flex-1 min-h-screen overflow-x-hidden p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex items-center justify-between mb-5">
             <div>
@@ -1127,6 +1159,7 @@ function exportMIS() {{
 }}
 window.onload = function() {{ renderMISPage(); }};
 </script>
+</div>
 </body></html>"""
     return HTMLResponse(html)
 
@@ -1199,7 +1232,9 @@ def rts_list(current_user: models.User = Depends(get_current_user), db: Session 
 <style>body{{font-family:'Inter',sans-serif;}}.filter-input{{font-size:11px;padding:4px 8px;border:1px solid #e2e8f0;border-radius:6px;background:#f8fafc;width:100%;box-sizing:border-box;}}
 .filter-input:focus{{outline:none;border-color:#f59e0b;background:#fff;}}</style>
 </head>
-<body class="bg-slate-50 min-h-screen p-6">
+<body class="bg-slate-50 min-h-screen flex">
+{build_sidebar(current_user, current_page='rts')}
+<div class="flex-1 min-h-screen overflow-x-hidden p-6">
     <div class="max-w-7xl mx-auto">
         <div class="flex items-center justify-between mb-5">
             <div>
@@ -1347,6 +1382,7 @@ function exportRTS() {{
 }}
 window.onload = function() {{ renderRTSPage(); }};
 </script>
+</div>
 </body></html>"""
     return HTMLResponse(html)
 
@@ -1539,6 +1575,7 @@ def edit_item(
     price: float = Form(...),
     supplier: str = Form(""),
     storage_site: str = Form(""),
+    category: str = Form(None),
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
@@ -1568,6 +1605,8 @@ def edit_item(
         db_item.supplier = supplier.strip()
     if storage_site.strip():
         db_item.storage_site = storage_site.strip()
+    if category and category.strip() in ASSET_CLASSES:
+        db_item.category = category.strip()
     # current_stock is updated by reconcile_stock_delta via the lot ledger
     reconcile_stock_delta(db, db_item, stock_delta)
     db.commit()
@@ -1773,6 +1812,7 @@ def create_procurement_request(
     department: str = Form(...),
     new_item_name: str = Form(None),
     detailed_specification: str = Form(None),
+    category: str = Form(None),
     db: Session = Depends(get_db),
     user_str: str = Cookie(None, alias="session_user")
 ):
@@ -1780,12 +1820,15 @@ def create_procurement_request(
         return RedirectResponse(url="/login", status_code=303)
     
     current_user = db.query(models.User).filter(models.User.username == user_str).first()
-    
+
+    clean_category = category.strip() if category and category.strip() in ASSET_CLASSES else DEFAULT_ASSET_CLASS
+
     new_request = models.ProcurementRequest(
         quantity=quantity,
         department=department.strip(),
         requested_by_id=current_user.id,
-        status="Pending"
+        status="Pending",
+        category=clean_category
     )
 
     if item_id == "NEW_PROCUREMENT_AD_HOC":
@@ -1802,6 +1845,9 @@ def create_procurement_request(
         new_request.is_new_item = False
         new_request.item_id = item_ent.id
         new_request.total_estimated_cost = float(item_ent.price * quantity)
+        # Keep the catalog item's category in sync with the indent's chosen category
+        item_ent.category = clean_category
+        new_request.category = item_ent.category
 
     db.add(new_request)
     db.commit()
@@ -2175,7 +2221,7 @@ def handle_procurement_action(
                     item_code=assigned_code,
                     name=real_name,
                     description=req.detailed_specification,
-                    category="Procured Items",
+                    category=(req.category if getattr(req, 'category', None) in ASSET_CLASSES else DEFAULT_ASSET_CLASS),
                     supplier="Pending Selection",
                     storage_site=req.department,
                     price=0.0,
@@ -2335,7 +2381,7 @@ def account_password_page(current_user: models.User = Depends(get_current_user),
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>body{{font-family:'Inter',sans-serif;}}</style>
 </head><body class="bg-slate-50 min-h-screen flex">
-{build_sidebar(current_user)}
+{build_sidebar(current_user, current_page='password')}
 <div class="flex-1 flex flex-col min-h-screen overflow-x-hidden">
 <div class="bg-white border-b border-slate-200 h-16 flex items-center justify-between px-8 shrink-0 shadow-sm z-10">
     <div class="flex items-center gap-2 text-xs font-semibold text-slate-400">
@@ -2357,6 +2403,13 @@ def account_password_page(current_user: models.User = Depends(get_current_user),
                 <input type="password" name="confirm_password" required minlength="4" class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-xs"></div>
             <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white p-2.5 rounded-xl font-bold tracking-wide transition-all text-xs">Update Password</button>
         </form>
+        <div class="mt-3 pt-3 border-t border-slate-100">
+            <p class="text-[10px] text-slate-400 leading-relaxed">
+                <i class="fa-solid fa-circle-info text-slate-400 mr-1"></i>
+                <b>Forgot your current password?</b> Ask your EIPL administrator to issue a temporary password
+                from the Grant User Access panel; you can then sign in and change it from here.
+            </p>
+        </div>
     </div>
     {admin_reset_panel}
 </div>
@@ -2474,12 +2527,25 @@ def delete_employee(emp_id: int, current_user: models.User = Depends(get_current
     return RedirectResponse(url="/", status_code=303)
 
 
-def build_sidebar(current_user) -> str:
-    """Returns the persistent left sidebar HTML for standalone pages."""
+def build_sidebar(current_user, current_page: str = "") -> str:
+    """Returns the persistent left sidebar HTML for standalone pages.
+    `current_page` keys: material-movement, grn, mis, rts, password."""
     import html as _html
     role_initial = (current_user.role or "S")[0].upper()
+    # Style helpers for active vs inactive nav items
+    nav_active = "w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl text-sm font-bold transition-all text-left"
+    nav_idle   = "w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group"
+    sub_active = "w-full flex items-center gap-3 px-3 py-2 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-lg text-xs font-bold transition-all"
+    sub_idle   = "w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-medium transition-all group"
+    def cls(key, active_cls, idle_cls):
+        return active_cls if current_page == key else idle_cls
+    def icon_cls(key, active_color, idle_size="w-5"):
+        # active variant uses solid color, idle uses muted slate with hover tint
+        if current_page == key:
+            return f"fa-solid {idle_size} text-center {active_color}"
+        return f"fa-solid {idle_size} text-center text-slate-400 group-hover:{active_color}"
     return f"""
-    <aside class="w-64 bg-white border-r border-slate-200 flex flex-col shrink-0 shadow-sm z-20 min-h-screen sticky top-0">
+    <aside class="w-64 bg-white border-r border-slate-200 flex flex-col shrink-0 shadow-sm z-20 sticky top-0 h-screen">
         <div class="p-5 border-b border-slate-100 text-center">
             <img src="/static/logo.png" alt="EIPL Logo" class="h-16 mx-auto mb-2 object-contain"
                 onerror="this.style.display='none';document.getElementById('sbLogoFallback').style.display='inline-block';">
@@ -2489,37 +2555,37 @@ def build_sidebar(current_user) -> str:
         </div>
         <nav class="flex-1 p-4 space-y-1 overflow-y-auto">
             <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">Core Dashboard</p>
-            <a href="/?tab=requisitions" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
+            <a href="/?tab=requisitions" class="{nav_idle}">
                 <i class="fa-solid fa-file-invoice-dollar w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Requisitions
             </a>
-            <a href="/material-movement" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
-                <i class="fa-solid fa-truck-ramp-box w-5 text-center text-slate-400 group-hover:text-emerald-600"></i> Material Movement
+            <a href="/material-movement" class="{cls('material-movement', nav_active, nav_idle)}">
+                <i class="{icon_cls('material-movement', 'text-emerald-600')} fa-truck-ramp-box"></i> Material Movement
             </a>
-            <a href="/" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
+            <a href="/" class="{nav_idle}">
                 <i class="fa-solid fa-boxes-stacked w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Inventory Configuration Log
             </a>
-            <a href="/?tab=allocations" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all group">
+            <a href="/?tab=allocations" class="{nav_idle}">
                 <i class="fa-solid fa-list-check w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Allocation Log
             </a>
             <div class="pt-4 mt-4 border-t border-slate-100 space-y-1">
                 <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-3 mb-2">Administration</p>
-                <a href="/?open=employee" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-medium transition-all group">
+                <a href="/?open=employee" class="{sub_idle}">
                     <i class="fa-solid fa-user-plus w-4 text-center text-slate-400 group-hover:text-indigo-600"></i> Employee Registry
                 </a>
-                <a href="/?open=access" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-medium transition-all group">
+                <a href="/?open=access" class="{sub_idle}">
                     <i class="fa-solid fa-key w-4 text-center text-slate-400 group-hover:text-emerald-600"></i> Grant User Access
                 </a>
-                <a href="/grn/list" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-medium transition-all group">
-                    <i class="fa-solid fa-download w-4 text-center text-slate-400 group-hover:text-indigo-600"></i> GRN Download Centre
+                <a href="/grn/list" class="{cls('grn', sub_active, sub_idle)}">
+                    <i class="{icon_cls('grn', 'text-indigo-600', 'w-4')} fa-download"></i> GRN Download Centre
                 </a>
-                <a href="/mis/list" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-medium transition-all group">
-                    <i class="fa-solid fa-file-arrow-down w-4 text-center text-slate-400 group-hover:text-indigo-600"></i> MIS Download Centre
+                <a href="/mis/list" class="{cls('mis', sub_active, sub_idle)}">
+                    <i class="{icon_cls('mis', 'text-indigo-600', 'w-4')} fa-file-arrow-down"></i> MIS Download Centre
                 </a>
-                <a href="/rts/list" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-medium transition-all group">
-                    <i class="fa-solid fa-arrow-rotate-left w-4 text-center text-slate-400 group-hover:text-amber-600"></i> RTS Download Centre
+                <a href="/rts/list" class="{cls('rts', sub_active, sub_idle)}">
+                    <i class="{icon_cls('rts', 'text-amber-600', 'w-4')} fa-arrow-rotate-left"></i> RTS Download Centre
                 </a>
-                <a href="/account/password" class="w-full flex items-center gap-3 px-3 py-2 text-slate-600 hover:bg-slate-50 rounded-lg text-xs font-medium transition-all group">
-                    <i class="fa-solid fa-lock w-4 text-center text-slate-400 group-hover:text-indigo-600"></i> Change Password
+                <a href="/account/password" class="{cls('password', sub_active, sub_idle)}">
+                    <i class="{icon_cls('password', 'text-indigo-600', 'w-4')} fa-lock"></i> Change Password
                 </a>
             </div>
         </nav>
@@ -2663,7 +2729,8 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
     employees = db.query(models.Employee).order_by(models.Employee.name).all()
     import json as _json, html as _html
     inv_json = _json.dumps([{"id": i.id, "name": i.name, "code": i.item_code, "stock": i.current_stock,
-        "uom": getattr(i,'uom',None) or "", "price": i.price or 0.0, "vendor": getattr(i,'supplier','') or ""} for i in items])
+        "uom": getattr(i,'uom',None) or "", "price": i.price or 0.0, "vendor": getattr(i,'supplier','') or "",
+        "category": getattr(i, 'category', None) or DEFAULT_ASSET_CLASS} for i in items])
 
     # Build map: {employee_name: [{item_id, name, code, uom, qty_held}]}
     # qty_held = sum(issues) - sum(prior returns) for that (item, employee)
@@ -2686,6 +2753,7 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
         held_map.setdefault(emp, []).append({
             "item_id": iid, "name": it.name, "code": it.item_code,
             "uom": (it.uom or "Nos"), "qty_held": qty,
+            "category": getattr(it, 'category', None) or DEFAULT_ASSET_CLASS,
         })
     held_json = _json.dumps(held_map)
 
@@ -2698,7 +2766,7 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>body{{font-family:'Inter',sans-serif;}}</style>
 </head><body class="bg-slate-50 min-h-screen flex">
-{build_sidebar(current_user)}
+{build_sidebar(current_user, current_page='material-movement')}
 <div class="flex-1 flex flex-col min-h-screen overflow-x-hidden">
 <div class="bg-white border-b border-slate-200 h-16 flex items-center justify-between px-8 shrink-0 shadow-sm z-10">
     <div class="flex items-center gap-2 text-xs font-semibold text-slate-400">
@@ -2717,7 +2785,7 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
       <div>
         <div class="flex items-center gap-2 mb-0.5">
           <span class="bg-emerald-500 text-white text-[10px] font-black px-2 py-0.5 rounded tracking-widest uppercase">Inward</span>
-          <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase">&#8595; Only Material Inward</h2>
+          <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase">&#8595; Material Inward</h2>
         </div>
         <p class="text-[10px] text-slate-400">Search existing item or register new — GRN mandatory</p>
       </div>
@@ -2734,6 +2802,11 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
         </div>
         <input type="hidden" id="inward_item_id" name="item_id" value="" required>
         <p id="inward_selected_label" class="text-[10px] text-slate-400 mt-1 italic">No item selected</p>
+      </div>
+      <div>
+        <label class="block font-semibold text-slate-500 mb-1">Category</label>
+        <input type="text" id="inward_category_display" readonly placeholder="\u2014 (auto-filled)"
+          class="w-full bg-slate-100 border border-slate-200 p-2 rounded-lg text-xs text-slate-500 cursor-not-allowed">
       </div>
       <div class="grid grid-cols-2 gap-2">
         <div><label class="block font-semibold text-slate-500 mb-1">Quantity Received</label>
@@ -2774,9 +2847,12 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
   <!-- RIGHT: OUTWARD -->
   <div class="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
     <div class="px-5 py-3 border-b-2 border-rose-400 bg-rose-50/60">
-      <div class="flex items-center gap-2 mb-0.5">
-        <span class="bg-rose-500 text-white text-[10px] font-black px-2 py-0.5 rounded tracking-widest uppercase">Outward</span>
-        <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase">&#8593; Material Issue</h2>
+      <div class="flex items-center justify-between mb-0.5">
+        <div class="flex items-center gap-2">
+          <span class="bg-rose-500 text-white text-[10px] font-black px-2 py-0.5 rounded tracking-widest uppercase">Outward</span>
+          <h2 class="text-xs font-black tracking-wider text-slate-800 uppercase">&#8593; Material Issue</h2>
+        </div>
+        <a href="/mis/bulk-template" class="bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-300 px-2 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1 whitespace-nowrap"><i class="fa-solid fa-download"></i> Template</a>
       </div>
       <p class="text-[10px] text-slate-400">Issue materials from store — MIS upload mandatory</p>
     </div>
@@ -2791,6 +2867,11 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
         </div>
         <input type="hidden" id="mis_item_id" name="item_id" required>
         <p id="mis_selected_label" class="text-[10px] text-slate-400 mt-1 italic">No item selected</p>
+      </div>
+      <div>
+        <label class="block font-semibold text-slate-500 mb-1">Category</label>
+        <input type="text" id="mis_category_display" readonly placeholder="\u2014 (auto-filled)"
+          class="w-full bg-slate-100 border border-slate-200 p-2 rounded-lg text-xs text-slate-500 cursor-not-allowed">
       </div>
       <div class="grid grid-cols-2 gap-2">
         <div><label class="block font-semibold text-slate-500 mb-1">Quantity to Issue</label>
@@ -2812,10 +2893,7 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
       <button type="submit" class="w-full bg-rose-600 hover:bg-rose-700 text-white p-2.5 rounded-xl font-bold tracking-wide transition-all text-xs">&#8593; Issue Material &amp; Upload MIS</button>
     </form>
     <div class="px-5 pb-5 border-t border-dashed border-slate-200 pt-3">
-      <div class="flex items-center justify-between mb-2">
-        <label class="block font-black text-[10px] uppercase text-rose-700 tracking-wider">&#128202; Bulk MIS Import (CSV)</label>
-        <a href="/mis/bulk-template" class="bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 px-2 py-1 rounded-lg text-[10px] font-bold flex items-center gap-1"><i class="fa-solid fa-download"></i> Template</a>
-      </div>
+      <label class="block font-black text-[10px] uppercase text-rose-700 tracking-wider mb-2">&#128202; Bulk MIS Import (CSV)</label>
       <form action="/mis/bulk-import" method="POST" enctype="multipart/form-data" class="flex gap-2">
         <input type="file" name="file" accept=".csv" required class="w-full bg-slate-50 border border-slate-200 text-slate-600 text-[10px] p-2 rounded-xl">
         <button type="submit" class="bg-rose-600 text-white px-3 py-2 rounded-xl font-bold text-[10px] shrink-0">Import</button>
@@ -2877,6 +2955,12 @@ def material_movement_page(current_user: models.User = Depends(get_current_user)
       </div>
 
       <div>
+        <label class="block font-semibold text-slate-500 mb-1">Category</label>
+        <input type="text" id="rts_category_display" readonly placeholder="\u2014 (auto-filled)"
+          class="w-full bg-slate-100 border border-slate-200 p-2 rounded-lg text-xs text-slate-500 cursor-not-allowed">
+      </div>
+
+      <div>
         <label class="block font-semibold text-slate-500 mb-1">Department</label>
         <input type="text" name="department" value="General Operations"
           class="w-full bg-slate-50 border border-slate-200 p-2 rounded-lg text-xs">
@@ -2914,8 +2998,10 @@ function onRtsEmployeeChange() {{
     var qty = document.getElementById('rts_qty');
     var qtyHelp = document.getElementById('rts_qty_help');
     var uomDisp = document.getElementById('rts_uom_display');
+    var catDisp = document.getElementById('rts_category_display');
     itemSel.innerHTML = '<option value="">-- Select item --</option>';
     uomDisp.value = ''; qty.value = 1; qty.max = ''; qtyHelp.textContent = 'Max: \u2014';
+    if (catDisp) catDisp.value = '';
     if (!emp) {{
         itemSel.disabled = true; panel.classList.add('hidden'); noBox.classList.add('hidden'); return;
     }}
@@ -2934,7 +3020,7 @@ function onRtsEmployeeChange() {{
         var opt = document.createElement('option');
         opt.value = r.item_id;
         opt.textContent = r.name + ' (' + r.code + ') \u2014 holding ' + r.qty_held + ' ' + r.uom;
-        opt.dataset.uom = r.uom; opt.dataset.max = r.qty_held;
+        opt.dataset.uom = r.uom; opt.dataset.max = r.qty_held; opt.dataset.category = r.category || '';
         itemSel.appendChild(opt);
     }});
     itemSel.disabled = false;
@@ -2945,10 +3031,14 @@ function onRtsItemChange() {{
     var qty = document.getElementById('rts_qty');
     var qtyHelp = document.getElementById('rts_qty_help');
     var uomDisp = document.getElementById('rts_uom_display');
+    var catDisp = document.getElementById('rts_category_display');
     if (!opt || !opt.value) {{
-        uomDisp.value = ''; qty.max = ''; qtyHelp.textContent = 'Max: \u2014'; return;
+        uomDisp.value = ''; qty.max = ''; qtyHelp.textContent = 'Max: \u2014';
+        if (catDisp) catDisp.value = '';
+        return;
     }}
     uomDisp.value = opt.dataset.uom || '';
+    if (catDisp) catDisp.value = opt.dataset.category || '';
     qty.max = opt.dataset.max || '';
     qty.value = 1;
     qtyHelp.textContent = 'Max: ' + (opt.dataset.max || '\u2014') + ' ' + (opt.dataset.uom || '');
@@ -2960,7 +3050,7 @@ function onRtsItemChange() {{
 var MMINV = JSON.parse(document.getElementById('mm-inv').textContent);
 function mkDd(items, cls) {{
     return items.slice(0,10).map(function(i) {{
-        return '<div class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 last:border-0 ' + cls + '" data-id="'+i.id+'" data-name="'+i.name.replace(/"/g,"&quot;")+'" data-code="'+i.code+'" data-stock="'+i.stock+'" data-uom="'+i.uom+'" data-price="'+i.price+'" data-vendor="'+i.vendor+'">' +
+        return '<div class="p-2.5 hover:bg-indigo-50 cursor-pointer border-b border-slate-100 last:border-0 ' + cls + '" data-id="'+i.id+'" data-name="'+i.name.replace(/"/g,"&quot;")+'" data-code="'+i.code+'" data-stock="'+i.stock+'" data-uom="'+i.uom+'" data-price="'+i.price+'" data-vendor="'+i.vendor+'" data-category="'+(i.category||'')+'">' +
         '<div class="font-semibold text-xs pointer-events-none">'+i.name+'</div>' +
         '<div class="text-[10px] text-slate-400 pointer-events-none">'+i.code+' | Stock: '+i.stock+'</div></div>';
     }}).join('') || '<div class="p-3 text-slate-400 text-xs">No items found</div>';
@@ -2988,6 +3078,7 @@ document.addEventListener('click',function(e){{
         document.getElementById('inward_selected_label').className='text-[10px] text-indigo-600 font-semibold mt-1';
         document.getElementById('inward_item_dropdown').classList.add('hidden');
         if(el.dataset.uom)document.getElementById('inward_uom_select').value=el.dataset.uom;
+        if(document.getElementById('inward_category_display'))document.getElementById('inward_category_display').value=el.dataset.category||'';
         return;
     }}
     var el2=e.target.closest('.mis-item');
@@ -2996,6 +3087,7 @@ document.addEventListener('click',function(e){{
         document.getElementById('mis_item_search').value=el2.dataset.name+' ('+el2.dataset.code+')';
         document.getElementById('mis_selected_label').textContent='Selected: '+el2.dataset.name+' | Stock: '+el2.dataset.stock;
         document.getElementById('mis_uom_display').value=el2.dataset.uom||'';
+        if(document.getElementById('mis_category_display'))document.getElementById('mis_category_display').value=el2.dataset.category||'';
         document.getElementById('mis_item_dropdown').classList.add('hidden');
         return;
     }}
@@ -3152,7 +3244,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         if it.current_stock <= it.minimum_stock:
             alert_status = ' <span class="text-rose-600 font-black animate-pulse">&#9888;&#65039; LOW</span>'
         
-        item_cat = getattr(it, 'category', 'Consumables')
+        item_cat = getattr(it, 'category', None) or DEFAULT_ASSET_CLASS
         item_sup = getattr(it, 'supplier', 'EIPL Approved Vendor')
         item_site = getattr(it, 'storage_site', 'Store Yard')
 
@@ -3161,6 +3253,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         h_code = _html.escape(it.item_code, quote=True)
         h_vendor = _html.escape(item_sup, quote=True)
         h_uom = _html.escape(getattr(it, 'uom', '') or '', quote=True)
+        h_cat = _html.escape(item_cat, quote=True)
 
         if current_user.role == "Admin":
             admin_only_cells = f"""
@@ -3179,6 +3272,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                         data-id="{it.id}" data-name="{h_name}" data-code="{h_code}"
                         data-price="{it.price}" data-stock="{it.current_stock}" data-minstock="{it.minimum_stock}"
                         data-supplier="{h_vendor}" data-site="{_html.escape(item_site, quote=True)}"
+                        data-category="{h_cat}"
                         class="text-amber-600 hover:underline font-bold text-[11px]">Edit</button>
                     <form action="/items/delete/{it.id}" method="POST" class="inline m-0 delete-protected-form" onsubmit="event.preventDefault(); openAdminDeleteModal(this, 'Delete item: {it.name} ({it.item_code})?');">
                         <button type="submit" class="text-rose-600 hover:underline font-bold text-[11px] bg-transparent border-none p-0 cursor-pointer inline">Delete</button>
@@ -3201,11 +3295,13 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             <td class="p-3 font-semibold text-slate-900">
                 <span>{it.name}</span>{alert_status}
                 <div class="text-[10px] text-slate-400 mt-0.5">
-                    <span class="bg-slate-100 px-1 py-0.5 rounded text-slate-600">{item_cat}</span> 
-                    &bull; <span class="bg-blue-50 px-1 py-0.5 rounded text-blue-600">{item_site}</span>
+                    <span class="bg-blue-50 px-1 py-0.5 rounded text-blue-600">{item_site}</span>
                 </div>
             </td>
             <td class="p-3 font-mono text-[11px] text-slate-500">{it.item_code}</td>
+            <td class="p-3 text-center">
+                <span class="bg-slate-100 px-2 py-0.5 rounded text-slate-600 text-[10px] font-semibold whitespace-nowrap">{item_cat}</span>
+            </td>
             {admin_only_cells}
             <td class="p-3 font-mono font-bold text-slate-900" data-sort="{it.current_stock}">
                 {it.current_stock}
@@ -3411,6 +3507,9 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             </form>
         </div>"""
 
+        # Category: falls back to the linked item's category, then default
+        req_category = getattr(r, 'category', None) or (getattr(r.item, 'category', None) if r.item else None) or DEFAULT_ASSET_CLASS
+
         req_rows += f"""<tr class="border-b hover:bg-slate-50 text-xs align-middle" data-row="1" data-date="{r.timestamp.strftime('%Y-%m-%d') if r.timestamp else ''}" data-text="{date_str} {r.requester.username if r.requester else ''} {r.status} {r.department or ''}">
             <td class="p-3 text-slate-500 font-mono whitespace-nowrap text-center">{date_str}</td>
             <td class="p-3 text-slate-800 text-center">{item_desc_display}</td>
@@ -3418,6 +3517,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             {est_td}
             <td class="p-3 text-center">{code_cell}</td>
             <td class="p-3 text-center">{spec_cell}</td>
+            <td class="p-3 text-center"><span class="bg-slate-100 px-2 py-0.5 rounded text-slate-600 text-[10px] font-semibold whitespace-nowrap">{req_category}</span></td>
             <td class="p-3 text-slate-500 whitespace-nowrap text-center">{r.requester.username if r.requester else 'System'}</td>
             <td class="p-3 text-center" data-status="{r.status}">{badge}</td>
             <td class="p-3">{msg_thread_cell}</td>
@@ -3429,6 +3529,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
     for a in assignments:
         ts = a.timestamp.strftime("%d-%m-%Y %H:%M") if a.timestamp else "—"
         item_name = a.item.name if a.item else 'Archived Asset'
+        item_category = getattr(a.item, 'category', None) or DEFAULT_ASSET_CLASS if a.item else DEFAULT_ASSET_CLASS
         dept = getattr(a, 'department', '—') or '—'
         is_ret = bool(getattr(a, 'is_return', False))
         if is_ret:
@@ -3442,6 +3543,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             <td class="p-3 font-bold text-slate-800">{item_name}</td>
             <td class="p-3 text-center" data-sort="{a.quantity}">{qty_html}</td>
             <td class="p-3 font-mono text-slate-500 text-center">{a.uom}</td>
+            <td class="p-3 text-center"><span class="bg-slate-100 px-2 py-0.5 rounded text-slate-600 text-[10px] font-semibold whitespace-nowrap">{item_category}</span></td>
             <td class="p-3 text-slate-700 font-medium"><span class="text-[9px] text-slate-400 block leading-tight">{person_label}</span>{a.issued_to}</td>
             <td class="p-3 text-slate-500">{dept}</td>
             <td class="p-3 text-slate-400 italic text-[11px]">{a.remarks or '—'}</td>
@@ -3492,16 +3594,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         </div>
         """
 
-        admin_panel = f"""
-        <div class="bg-white border border-slate-200 rounded-xl shadow-sm p-4 mb-4 flex flex-col items-center text-center gap-2">
-            <i class="fa-solid fa-truck-ramp-box text-2xl text-emerald-500"></i>
-            <div>
-                <h3 class="font-black text-slate-800 text-xs leading-tight">Material Movement</h3>
-                <p class="text-[10px] text-slate-400 leading-tight mt-0.5">Inward &amp; outward transactions</p>
-            </div>
-            <a href="/material-movement" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] px-3 py-2 rounded-lg transition-all whitespace-nowrap">Open &#8594;</a>
-        </div>
-        """
+        admin_panel = ""
 
         user_list_markup = ""
         for u in users:
@@ -3570,4 +3663,6 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         .replace("__ASSIGNED_ROWS__", assigned_rows)\
         .replace("__MIS_INVENTORY_JSON__", mis_inventory_json_safe)\
         .replace("__EST_VALUE_HEADER__", est_value_header)\
+        .replace("__ASSET_CLASS_OPTIONS_JSON__", _json.dumps(ASSET_CLASSES))\
+        .replace("__ASSET_CLASS_OPTIONS__", category_options_html())\
         .replace("__IS_ADMIN__", "true" if current_user.role == "Admin" else "false")

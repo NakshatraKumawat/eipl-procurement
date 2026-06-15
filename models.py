@@ -79,6 +79,9 @@ class ProcurementRequest(Base):
     vendor = Column(String, nullable=True)        # Vendor chosen by admin before ordering
     unit_price = Column(Float, nullable=True)      # Per-unit rate entered by admin before ordering
 
+    # --- ASSET CLASS CATEGORY (Fixed Assets and Equipments / Consumables / Tools and Tackles) ---
+    category = Column(String, nullable=True)
+
     item = relationship("Item")
     requester = relationship("User")
 
