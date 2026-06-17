@@ -125,7 +125,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
             </a>
 
             <button id="nav-inventory" onclick="switchTab('inventory')" class="w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left">
-                <i class="fa-solid fa-boxes-stacked w-5 text-center text-indigo-600"></i> Inventory Configuration Log
+                <i class="fa-solid fa-boxes-stacked w-5 text-center text-indigo-600"></i> Inventory Log
             </button>
             
             <button id="nav-allocations" onclick="switchTab('allocations')" class="w-full flex items-center gap-3 px-3 py-2.5 text-slate-600 hover:bg-slate-50 hover:text-slate-900 rounded-xl text-sm font-medium transition-all text-left group">
@@ -181,7 +181,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
             <div class="flex items-center gap-2 text-xs font-semibold text-slate-400">
                 <span class="uppercase tracking-wider text-indigo-600 font-bold">EIPL Framework</span>
                 <i class="fa-solid fa-chevron-right text-[9px] text-slate-300"></i>
-                <span id="header-breadcrumb" class="text-slate-700 font-medium">Inventory Configuration Dashboard</span>
+                <span id="header-breadcrumb" class="text-slate-700 font-medium">Inventory Dashboard</span>
             </div>
         </header>
 
@@ -193,13 +193,13 @@ LAYOUT_HTML = """<!DOCTYPE html>
                     <div id="inventory-table-container" class="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
                         <div class="p-5 border-b border-slate-100 bg-white flex flex-wrap items-center justify-between gap-3">
                             <div>
-                                <h2 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Consolidated Inventory Configuration</h2>
+                                <h2 class="text-xs font-bold text-slate-900 uppercase tracking-wider">Consolidated Inventory</h2>
                                 <p class="text-[10px] text-slate-400 mt-0.5">Real-time warehouse material mapping and safety levels</p>
                             </div>
                             <div class="flex flex-wrap items-center gap-2">
                                 <div class="relative">
                                     <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
-                                    <input type="text" id="invSearch" placeholder="Search inventory..." autocomplete="off" oninput="filterTable('inv')"
+                                    <input type="text" id="invSearch" placeholder="Search inventory..." autocomplete="off" readonly onfocus="this.removeAttribute('readonly')" oninput="filterTable('inv')"
                                         class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-40">
                                 </div>
                                 <select id="invPageSize" onchange="changePageSize('inv')" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl focus:outline-none focus:border-indigo-400">
@@ -219,10 +219,11 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                         <th class="p-4 pl-5 cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',0)">Item Name <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',1)">Item Code <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',2)">Category <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                        <th class="p-4 admin-only-col text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',3)">Previous Vendor <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                        <th class="p-4 admin-only-col text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',4)">Previous Price <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',5)">Current Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',6)">Safety Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 text-center">UOM</th>
+                                        <th class="p-4 admin-only-col text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',4)">Previous Vendor <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 admin-only-col text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',5)">Previous Price <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',6)">Current Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                        <th class="p-4 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('inv',7)">Safety Stock <i class="fa-solid fa-sort text-[9px]"></i></th>
                                         <th class="p-4 text-right pr-5">Actions</th>
                                         <th class="p-4 text-center">Transaction Log</th>
                                     </tr>
@@ -305,6 +306,9 @@ LAYOUT_HTML = """<!DOCTYPE html>
                             </div>
                         </div>
 
+                        <!-- Vendor & price are NOT entered here anymore — the admin sets them
+                             in the Procurement Pipeline (Order Pending → Save vendor & rate). -->
+
                         <!-- Ad-hoc fields: shown only when NEW is selected -->
                         <div id="adhoc_procurement_fields_group" class="grid grid-cols-3 gap-3 mb-3 bg-amber-50/40 p-3 border border-amber-200/50 rounded-xl">
                             <div>
@@ -364,7 +368,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                 <!-- Search box -->
                                 <div class="relative">
                                     <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
-                                    <input type="text" id="reqSearch" placeholder="Search indents..." autocomplete="off" oninput="filterTable('req')"
+                                    <input type="text" id="reqSearch" placeholder="Search indents..." autocomplete="off" readonly onfocus="this.removeAttribute('readonly')" oninput="filterTable('req')"
                                         class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-44">
                                 </div>
                                 <!-- Status filter -->
@@ -394,12 +398,13 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                     <th class="p-3 pl-5 whitespace-nowrap text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',0)">Time Stamp <i class="fa-solid fa-sort text-[9px]"></i></th>
                                     <th class="p-3 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',1)">Item Description <i class="fa-solid fa-sort text-[9px]"></i></th>
                                     <th class="p-3 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',2)">Qty <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3 text-center">UOM</th>
                                     __EST_VALUE_HEADER__
                                     <th class="p-3 text-center">Item Code</th>
                                     <th class="p-3 text-center">Specification</th>
                                     <th class="p-3 text-center">Category</th>
-                                    <th class="p-3 text-center whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable('req',6)">Requested By <i class="fa-solid fa-sort text-[9px]"></i></th>
-                                    <th class="p-3 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',7)">Status <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3 text-center whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable('req',7)">Requested By <i class="fa-solid fa-sort text-[9px]"></i></th>
+                                    <th class="p-3 text-center cursor-pointer hover:text-indigo-600" onclick="sortTable('req',8)">Status <i class="fa-solid fa-sort text-[9px]"></i></th>
                                     <th class="p-3 text-center">Communication</th>
                                     <th class="p-3 text-center whitespace-nowrap">Workflow</th>
                                 </tr>
@@ -430,7 +435,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
                                 <div class="flex flex-wrap items-center gap-2">
                                     <div class="relative">
                                         <i class="fa-solid fa-search absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400 text-[10px]"></i>
-                                        <input type="text" id="allocSearch" placeholder="Search allocations..." autocomplete="off" oninput="filterTable('alloc')"
+                                        <input type="text" id="allocSearch" placeholder="Search allocations..." autocomplete="off" readonly onfocus="this.removeAttribute('readonly')" oninput="filterTable('alloc')"
                                             class="pl-7 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:border-indigo-400 w-40">
                                     </div>
                                     <select id="allocPageSize" onchange="changePageSize('alloc')" class="bg-slate-50 border border-slate-200 text-xs px-2.5 py-2 rounded-xl focus:outline-none focus:border-indigo-400">
@@ -965,7 +970,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
 
             if (tabId === 'inventory') {
                 document.getElementById('tab-viewport-inventory').style.display = 'grid';
-                breadcrumb.innerText = "Inventory Configuration Dashboard";
+                breadcrumb.innerText = "Inventory Dashboard";
                 activeNav.className = "w-full flex items-center gap-3 px-3 py-2.5 text-indigo-700 bg-indigo-50 border border-indigo-100/50 rounded-xl font-bold text-sm transition-all text-left";
                 activeNav.querySelector('i').className = "fa-solid fa-boxes-stacked w-5 text-center text-indigo-600";
                 tagRows('invTableBody'); renderTable('inv');
@@ -987,6 +992,18 @@ LAYOUT_HTML = """<!DOCTYPE html>
         }
 
         window.addEventListener('DOMContentLoaded', () => {
+            // Clear search fields immediately and again after a short delay —
+            // Chrome autofill fires asynchronously after DOMContentLoaded and can
+            // repopulate fields even with autocomplete="off". The 300ms delay beats it.
+            function clearSearchFields() {
+                ['invSearch','reqSearch','allocSearch','proc_item_search'].forEach(function(id){
+                    var el = document.getElementById(id);
+                    if (el) { el.value = ''; }
+                });
+            }
+            clearSearchFields();
+            setTimeout(clearSearchFields, 300);
+
             var urlParams = new URLSearchParams(window.location.search);
             var tabParam = urlParams.get('tab');
             if (tabParam === 'allocations' || window.location.hash.includes('allocations')) {
@@ -1199,7 +1216,7 @@ LAYOUT_HTML = """<!DOCTYPE html>
         function downloadInventoryExcel() {
             // Build CSV matching exact table headers and data
             var isAdmin = __IS_ADMIN__;
-            var headers = ['Item Name', 'Item Code', 'Category'];
+            var headers = ['Item Name', 'Item Code', 'Category', 'UOM'];
             if (isAdmin) { headers.push('Vendor / Supplier', 'Price (INR)'); }
             headers.push('Current Stock', 'Safety Stock');
 
@@ -1217,20 +1234,22 @@ LAYOUT_HTML = """<!DOCTYPE html>
                     rowData.push(cells[1] ? cells[1].innerText.trim() : '');
                     // Category
                     rowData.push(cells[2] ? cells[2].innerText.trim() : '');
+                    // UOM (col 3 — always present)
+                    rowData.push(cells[3] ? cells[3].innerText.trim() : '');
                     if (isAdmin) {
-                        // Vendor
-                        rowData.push(cells[3] ? cells[3].innerText.trim() : '');
-                        // Price — strip ₹ and commas
-                        rowData.push(cells[4] ? cells[4].innerText.replace(/[₹,]/g,'').trim() : '');
-                        // Current Stock
-                        rowData.push(cells[5] ? cells[5].innerText.trim() : '');
-                        // Safety Stock
-                        rowData.push(cells[6] ? cells[6].innerText.trim() : '');
-                    } else {
-                        // Current Stock (col 3 for staff view)
-                        rowData.push(cells[3] ? cells[3].innerText.trim() : '');
-                        // Safety Stock
+                        // Vendor (col 4)
                         rowData.push(cells[4] ? cells[4].innerText.trim() : '');
+                        // Price — strip ₹ and commas (col 5)
+                        rowData.push(cells[5] ? cells[5].innerText.replace(/[₹,]/g,'').trim() : '');
+                        // Current Stock (col 6)
+                        rowData.push(cells[6] ? cells[6].innerText.trim() : '');
+                        // Safety Stock (col 7)
+                        rowData.push(cells[7] ? cells[7].innerText.trim() : '');
+                    } else {
+                        // Current Stock (col 4 for staff — no admin cols)
+                        rowData.push(cells[4] ? cells[4].innerText.trim() : '');
+                        // Safety Stock (col 5)
+                        rowData.push(cells[5] ? cells[5].innerText.trim() : '');
                     }
                     rows.push(rowData);
                 });
@@ -1326,38 +1345,62 @@ LAYOUT_HTML = """<!DOCTYPE html>
                 _pendingDeleteForm = null;
             };
 
+            function _resetDeleteBtn() {
+                var b = document.getElementById('adminDeleteConfirmBtn');
+                if (b) { b.innerHTML = '<i class="fa-solid fa-trash-can mr-1"></i> Confirm Delete'; b.disabled = false; }
+            }
+            function _showDeleteError(msg) {
+                var e = document.getElementById('adminDeleteError');
+                if (e) { e.textContent = msg; e.classList.remove('hidden'); }
+            }
+
             window.confirmAdminDelete = function() {
                 var pw = document.getElementById('adminDeletePassword').value;
-                if (!pw) {
-                    document.getElementById('adminDeleteError').textContent = 'Password is required.';
-                    document.getElementById('adminDeleteError').classList.remove('hidden');
-                    return;
-                }
+                if (!pw) { _showDeleteError('Password is required.'); return; }
+
                 var btn = document.getElementById('adminDeleteConfirmBtn');
-                btn.textContent = 'Verifying…';
+                btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> Verifying...';
                 btn.disabled = true;
+                document.getElementById('adminDeleteError').classList.add('hidden');
 
                 var fd = new FormData();
                 fd.append('password', pw);
-                fetch('/admin/verify-password', { method: 'POST', body: fd })
-                .then(function(r){ return r.json().then(function(d){ return {ok: r.ok, data: d}; }); })
+
+                // Safety net: reset button after 12s if fetch hangs
+                var safetyTimer = setTimeout(function() {
+                    _resetDeleteBtn();
+                    _showDeleteError('Request timed out. Please try again.');
+                }, 12000);
+
+                fetch('/admin/verify-password', {
+                    method: 'POST',
+                    body: fd,
+                    credentials: 'same-origin'   // ← CRITICAL: sends session cookie with fetch
+                })
+                .then(function(r) {
+                    return r.text().then(function(txt) {
+                        clearTimeout(safetyTimer);
+                        var data;
+                        try { data = JSON.parse(txt); } catch(e) { data = {ok: false, msg: 'Server error (non-JSON response). Please re-login and try again.'}; }
+                        return { httpOk: r.ok, data: data };
+                    });
+                })
                 .then(function(res) {
-                    if (res.ok && res.data.ok) {
-                        // Password correct — submit the pending form
+                    if (res.httpOk && res.data.ok) {
+                        // Snapshot the form ref BEFORE closing the modal,
+                        // since closeAdminDeleteModal() nulls _pendingDeleteForm.
+                        var formToSubmit = _pendingDeleteForm;
                         closeAdminDeleteModal();
-                        if (_pendingDeleteForm) _pendingDeleteForm.submit();
+                        if (formToSubmit) formToSubmit.submit();
                     } else {
-                        document.getElementById('adminDeleteError').textContent = res.data.msg || 'Incorrect password. Access denied.';
-                        document.getElementById('adminDeleteError').classList.remove('hidden');
-                        btn.textContent = 'Confirm Delete';
-                        btn.disabled = false;
+                        _showDeleteError((res.data && res.data.msg) || 'Incorrect password.');
+                        _resetDeleteBtn();
                     }
                 })
-                .catch(function() {
-                    document.getElementById('adminDeleteError').textContent = 'Server error. Try again.';
-                    document.getElementById('adminDeleteError').classList.remove('hidden');
-                    btn.textContent = 'Confirm Delete';
-                    btn.disabled = false;
+                .catch(function(err) {
+                    clearTimeout(safetyTimer);
+                    _showDeleteError('Network error. Check your connection and try again.');
+                    _resetDeleteBtn();
                 });
             };
 
@@ -1371,6 +1414,85 @@ LAYOUT_HTML = """<!DOCTYPE html>
                 });
             });
         })();
+    </script>
+
+    <!-- ===== Assign Code Duplicate Confirmation Modal ===== -->
+    <div id="assignCodeDupModal" style="display:none;" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-[9998]">
+        <div class="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-sm mx-4 p-6">
+            <div class="flex items-center gap-3 mb-4">
+                <div class="w-10 h-10 rounded-xl bg-amber-100 flex items-center justify-center shrink-0">
+                    <i class="fa-solid fa-triangle-exclamation text-amber-600 text-sm"></i>
+                </div>
+                <div>
+                    <h3 class="text-sm font-black text-slate-900">Code Already Assigned</h3>
+                    <p class="text-[11px] text-slate-400 mt-0.5">This item code exists in the catalog</p>
+                </div>
+            </div>
+            <div class="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-4 space-y-1.5">
+                <p class="text-xs text-slate-700">This code has already been assigned to the following item:</p>
+                <div class="flex items-center gap-2 mt-1.5">
+                    <span class="font-mono font-black text-amber-700 bg-amber-100 border border-amber-200 px-2 py-0.5 rounded text-[11px]" id="dupModalCode"></span>
+                    <span class="text-xs font-bold text-slate-800" id="dupModalName"></span>
+                </div>
+                <p class="text-[11px] text-slate-500 mt-2">Click <b>Proceed</b> to assign the same code to this item as well.</p>
+            </div>
+            <div class="flex gap-3">
+                <button type="button" onclick="closeAssignCodeDupModal()" class="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs p-2.5 rounded-xl border border-slate-200 transition-all">Cancel</button>
+                <button type="button" id="dupModalProceedBtn" onclick="proceedAssignCode()" class="flex-1 bg-amber-500 hover:bg-amber-600 text-white font-bold text-xs p-2.5 rounded-xl transition-all">
+                    <i class="fa-solid fa-check mr-1"></i> Proceed
+                </button>
+            </div>
+        </div>
+    </div>
+    <script>
+    (function() {
+        var _pendingAssignForm = null;
+        var _pendingReqId = null;
+
+        window.handleAssignCodeSubmit = function(e, reqId) {
+            e.preventDefault();
+            var form = e.target;
+            var codeInput = form.querySelector('input[name="new_item_code"]');
+            var code = codeInput ? codeInput.value.trim().toUpperCase() : '';
+            if (!code) return false;
+
+            // Check if code exists in catalog
+            fetch('/procurement/check-code?code=' + encodeURIComponent(code))
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.exists) {
+                        // Show confirmation modal
+                        _pendingAssignForm = form;
+                        _pendingReqId = reqId;
+                        document.getElementById('dupModalCode').textContent = data.item_code;
+                        document.getElementById('dupModalName').textContent = data.item_name;
+                        document.getElementById('assignCodeDupModal').style.display = 'flex';
+                    } else {
+                        // No conflict — submit straight away
+                        form.querySelector('input[name="force"]').value = 'false';
+                        form.submit();
+                    }
+                })
+                .catch(function() {
+                    // Network error — fall through and let server decide
+                    form.submit();
+                });
+            return false;
+        };
+
+        window.closeAssignCodeDupModal = function() {
+            document.getElementById('assignCodeDupModal').style.display = 'none';
+            _pendingAssignForm = null;
+            _pendingReqId = null;
+        };
+
+        window.proceedAssignCode = function() {
+            if (!_pendingAssignForm) return;
+            _pendingAssignForm.querySelector('input[name="force"]').value = 'true';
+            _pendingAssignForm.submit();
+            document.getElementById('assignCodeDupModal').style.display = 'none';
+        };
+    })();
     </script>
 
     <!-- ===== Merged Transaction Log Modal (from Material Flow Dashboard) ===== -->

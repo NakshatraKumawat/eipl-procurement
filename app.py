@@ -451,6 +451,10 @@ def run_structural_database_migrations():
                 _ddl_conn.execute(text("ALTER TABLE procurement_requests ADD COLUMN category TEXT"))
             except Exception:
                 pass
+            try:
+                _ddl_conn.execute(text("ALTER TABLE procurement_requests ADD COLUMN uom TEXT DEFAULT 'Nos'"))
+            except Exception:
+                pass
             # --- Fixed Assets and Equipments per-unit tracking ---
             try:
                 _ddl_conn.execute(text("ALTER TABLE material_assignments ADD COLUMN asset_unit_id INTEGER"))
@@ -521,7 +525,7 @@ def do_login(response: Response, username: str = Form(...), password: str = Form
         return HTMLResponse("<script>alert('Invalid credentials!'); window.location='/login';</script>")
 
     res = RedirectResponse(url="/", status_code=303)
-    res.set_cookie(key="session_user", value=user.username)
+    res.set_cookie(key="session_user", value=user.username, samesite="lax", httponly=True)
     return res
 
 
@@ -1686,12 +1690,37 @@ def edit_item(
 def delete_item(item_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not current_user or current_user.role != "Admin":
         return HTMLResponse("Access Denied", status_code=403)
-    db.query(models.ItemLot).filter(models.ItemLot.item_id == item_id).delete()
-    db.query(models.Transaction).filter(models.Transaction.item_id == item_id).delete()
-    db.query(models.ProcurementRequest).filter(models.ProcurementRequest.item_id == item_id).delete()
-    db.query(models.MaterialAssignment).filter(models.MaterialAssignment.item_id == item_id).delete()
-    db.query(models.Item).filter(models.Item.id == item_id).delete()
-    db.commit()
+    try:
+        # Nullify FK back-references on AssetUnits first
+        db.query(models.AssetUnit).filter(models.AssetUnit.item_id == item_id).update(
+            {"current_assignment_id": None}, synchronize_session=False
+        )
+        db.flush()
+        # Delete all child rows in safe dependency order
+        db.query(models.GRNRecord).filter(models.GRNRecord.item_id == item_id).delete(synchronize_session=False)
+        db.query(models.MaterialAssignment).filter(models.MaterialAssignment.item_id == item_id).delete(synchronize_session=False)
+        db.query(models.AssetUnit).filter(models.AssetUnit.item_id == item_id).delete(synchronize_session=False)
+        db.query(models.ItemLot).filter(models.ItemLot.item_id == item_id).delete(synchronize_session=False)
+        db.query(models.Transaction).filter(models.Transaction.item_id == item_id).delete(synchronize_session=False)
+        # Procurement: delete messages first (FK -> procurement_requests.id), then the requests
+        proc_ids = [r[0] for r in db.query(models.ProcurementRequest.id).filter(
+            models.ProcurementRequest.item_id == item_id
+        ).all()]
+        if proc_ids:
+            db.query(models.ProcurementMessage).filter(
+                models.ProcurementMessage.request_id.in_(proc_ids)
+            ).delete(synchronize_session=False)
+        db.query(models.ProcurementRequest).filter(models.ProcurementRequest.item_id == item_id).delete(synchronize_session=False)
+        db.query(models.MaterialRequest).filter(models.MaterialRequest.item_id == item_id).delete(synchronize_session=False)
+        db.query(models.Item).filter(models.Item.id == item_id).delete(synchronize_session=False)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        safe_msg = str(exc).replace("'", "").replace('"', '')[:200]
+        return HTMLResponse(
+            f"<script>alert('Delete failed: {safe_msg}'); window.history.back();</script>",
+            status_code=200
+        )
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -1925,6 +1954,7 @@ async def return_to_store(
 def create_procurement_request(
     item_id: str = Form(...),
     quantity: int = Form(...),
+    uom: str = Form("Nos"),
     department: str = Form(...),
     new_item_name: str = Form(None),
     detailed_specification: str = Form(None),
@@ -1934,46 +1964,76 @@ def create_procurement_request(
 ):
     if not user_str:
         return RedirectResponse(url="/login", status_code=303)
-    
+
     current_user = db.query(models.User).filter(models.User.username == user_str).first()
 
+    # The category chosen on the form only applies to brand-new ad-hoc items.
+    # For existing catalog items we must NEVER overwrite their asset class from
+    # the indent form — the item keeps whatever class it already has (a
+    # consumable stays a consumable) until it's changed manually in Edit Item.
     clean_category = category.strip() if category and category.strip() in ASSET_CLASSES else DEFAULT_ASSET_CLASS
 
     new_request = models.ProcurementRequest(
         quantity=quantity,
+        uom=(uom or "Nos").strip(),
         department=department.strip(),
         requested_by_id=current_user.id,
         status="Pending",
-        category=clean_category
     )
+
+    # Vendor and unit price are NOT captured at indent time anymore.
+    # The admin enters them later in the Procurement Pipeline
+    # (Order Pending -> "Save" vendor & rate via /procurement/set-pricing).
 
     if item_id == "NEW_PROCUREMENT_AD_HOC":
         new_request.is_new_item = True
         new_request.item_id = None
         new_request.new_item_name = new_item_name.strip() if new_item_name else "Unlisted Item"
         new_request.detailed_specification = detailed_specification.strip() if detailed_specification else "No specs"
+        # Brand-new item: honour the class the requester picked on the form.
+        new_request.category = clean_category
+        # No rate yet — priced in the pipeline before ordering.
         new_request.total_estimated_cost = 0.0
     else:
         item_ent = db.query(models.Item).filter(models.Item.id == int(item_id)).first()
         if not item_ent:
             return HTMLResponse("<h2>Error: Item not found in Catalog</h2>", status_code=400)
-        
+
         new_request.is_new_item = False
         new_request.item_id = item_ent.id
-        new_request.total_estimated_cost = float(item_ent.price * quantity)
-        # Keep the catalog item's category in sync with the indent's chosen category
-        item_ent.category = clean_category
-        new_request.category = item_ent.category
+        # Provisional estimate from the catalog's last known price; the final
+        # rate (and vendor) is set by the admin in the pipeline before ordering.
+        new_request.total_estimated_cost = float(item_ent.price or 0.0) * quantity
+        # Inherit the item's EXISTING asset class — do not change the item itself.
+        new_request.category = item_ent.category or DEFAULT_ASSET_CLASS
 
     db.add(new_request)
     db.commit()
     return RedirectResponse(url="/#requisitions-panel", status_code=303)
 
 
+@app.get("/procurement/check-code")
+def check_item_code(
+    code: str,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Returns JSON indicating whether the given item code already exists in catalog."""
+    from fastapi.responses import JSONResponse
+    if not current_user or current_user.role != "Admin":
+        return JSONResponse({"error": "Unauthorized"}, status_code=403)
+    clean_code = code.strip().upper()
+    duplicate = db.query(models.Item).filter(models.Item.item_code == clean_code).first()
+    if duplicate:
+        return JSONResponse({"exists": True, "item_name": duplicate.name, "item_code": duplicate.item_code})
+    return JSONResponse({"exists": False})
+
+
 @app.post("/procurement/assign-code/{req_id}")
 def assign_item_code(
     req_id: int,
     new_item_code: str = Form(...),
+    force: str = Form(default="false"),
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1986,12 +2046,13 @@ def assign_item_code(
 
     clean_code = new_item_code.strip().upper()
 
-    # Check uniqueness against existing catalog items
-    duplicate = db.query(models.Item).filter(models.Item.item_code == clean_code).first()
-    if duplicate:
-        return HTMLResponse(
-            f"<script>alert('Error: Code \"{clean_code}\" already exists in catalog for \"{duplicate.name}\". Please use a unique code.'); window.history.back();</script>"
-        )
+    # Check uniqueness against existing catalog items — skip if admin confirmed via force flag
+    if force.lower() != "true":
+        duplicate = db.query(models.Item).filter(models.Item.item_code == clean_code).first()
+        if duplicate:
+            return HTMLResponse(
+                f"<script>alert('Error: Code \"{clean_code}\" already exists in catalog for \"{duplicate.name}\". Please use a unique code.'); window.history.back();</script>"
+            )
 
     # Store assigned code in the supplier field of the pending request (reuse unused nullable field)
     # We prefix it clearly so Accept logic can detect and extract it
@@ -2053,9 +2114,9 @@ def procurement_bulk_template(current_user: models.User = Depends(get_current_us
         return RedirectResponse(url="/login", status_code=303)
     from fastapi.responses import StreamingResponse
     import io
-    csv_content = "item_id_or_NEW,item_name,specification,quantity,department\n"
-    csv_content += "1,,(leave blank for existing items),5,Operations\n"
-    csv_content += "NEW,Steel Pipe 25mm,Grade A - 25mm dia x 6m length - IS 1239,10,Mechanical\n"
+    csv_content = "item_id_or_NEW,item_name,specification,quantity,uom,department\n"
+    csv_content += "1,,(leave blank for existing items),5,Nos,Operations\n"
+    csv_content += "NEW,Steel Pipe 25mm,Grade A - 25mm dia x 6m length - IS 1239,10,Mtr,Mechanical\n"
     return StreamingResponse(
         io.StringIO(csv_content),
         media_type="text/csv",
@@ -2085,6 +2146,7 @@ async def procurement_bulk_import(
             item_ref = clean.get("item_id_or_new", "").upper()
             quantity_raw = clean.get("quantity", "1")
             department = clean.get("department", "General Operations")
+            uom = clean.get("uom", "Nos").strip() or "Nos"
             try:
                 quantity = int(float(quantity_raw))
             except ValueError:
@@ -2093,6 +2155,7 @@ async def procurement_bulk_import(
                 continue
             new_req = models.ProcurementRequest(
                 quantity=quantity,
+                uom=uom,
                 department=department.strip(),
                 requested_by_id=current_user.id,
                 status="Pending",
@@ -2248,11 +2311,22 @@ def admin_verify_password(
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Returns JSON 200 if admin password is correct, 403 otherwise."""
+    """Returns JSON 200 if the supplied password matches ANY admin account.
+    Always returns JSON — never redirects — so the frontend fetch never
+    receives an HTML response it can't parse."""
     from fastapi.responses import JSONResponse
-    if not current_user or current_user.role != "Admin":
-        return JSONResponse({"ok": False, "msg": "Not an admin account."}, status_code=403)
-    if current_user.hashed_password != hash_password(password):
+    # Session may be missing if cookie wasn't sent — give a clear message
+    if not current_user:
+        return JSONResponse({"ok": False, "msg": "Session expired. Please re-login and try again."}, status_code=401)
+    if current_user.role != "Admin":
+        return JSONResponse({"ok": False, "msg": "Admin privileges required."}, status_code=403)
+    hashed = hash_password(password)
+    # Accept password of ANY admin user (not just the session owner)
+    matching_admin = db.query(models.User).filter(
+        models.User.role == "Admin",
+        models.User.hashed_password == hashed
+    ).first()
+    if not matching_admin:
         return JSONResponse({"ok": False, "msg": "Incorrect admin password."}, status_code=403)
     return JSONResponse({"ok": True})
 
@@ -2359,6 +2433,7 @@ def edit_procurement_request(
     request_id: int,
     item_id: int = Form(...),
     quantity: int = Form(...),
+    uom: str = Form("Nos"),
     department: str = Form(...),
     session_user: str = Cookie(None),
     db: Session = Depends(get_db)
@@ -2374,6 +2449,7 @@ def edit_procurement_request(
     if item:
         req.item_id = item_id
         req.quantity = quantity
+        req.uom = (uom or "Nos").strip()
         req.total_estimated_cost = float(quantity * item.price)
         req.department = department
         db.commit()
@@ -2395,8 +2471,20 @@ def delete_procurement_request(
         return HTMLResponse("Access Denied: Admin privileges required to delete records.", status_code=403)
     req = db.query(models.ProcurementRequest).filter(models.ProcurementRequest.id == request_id).first()
     if req:
-        db.delete(req)
-        db.commit()
+        try:
+            # Clear messages first (FK -> procurement_requests.id)
+            db.query(models.ProcurementMessage).filter(
+                models.ProcurementMessage.request_id == request_id
+            ).delete(synchronize_session=False)
+            db.delete(req)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            safe_msg = str(exc).replace("'", "").replace('"', '')[:200]
+            return HTMLResponse(
+                f"<script>alert('Delete failed: {safe_msg}'); window.history.back();</script>",
+                status_code=200
+            )
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -2582,9 +2670,36 @@ def admin_delete_user(target_id: int, current_user: models.User = Depends(get_cu
         return HTMLResponse("Unauthorized", status_code=403)
     if current_user.id == target_id:
         return HTMLResponse("<script>alert('Constraint blocked.'); window.location='/';</script>")
-
-    db.query(models.User).filter(models.User.id == target_id).delete()
-    db.commit()
+    try:
+        # Preserve audit history: null FK references on dependent rows instead
+        # of cascading deletes (we want to keep the transactions / GRNs / MIS records).
+        db.query(models.ProcurementRequest).filter(
+            models.ProcurementRequest.requested_by_id == target_id
+        ).update({"requested_by_id": None}, synchronize_session=False)
+        db.query(models.MaterialAssignment).filter(
+            models.MaterialAssignment.mis_uploaded_by_id == target_id
+        ).update({"mis_uploaded_by_id": None}, synchronize_session=False)
+        db.query(models.Transaction).filter(
+            models.Transaction.user_id == target_id
+        ).update({"user_id": None}, synchronize_session=False)
+        db.query(models.GRNRecord).filter(
+            models.GRNRecord.uploaded_by_id == target_id
+        ).update({"uploaded_by_id": None}, synchronize_session=False)
+        db.query(models.MaterialRequest).filter(
+            models.MaterialRequest.requested_by_id == target_id
+        ).update({"requested_by_id": None}, synchronize_session=False)
+        db.query(models.ProcurementMessage).filter(
+            models.ProcurementMessage.sender_id == target_id
+        ).update({"sender_id": None}, synchronize_session=False)
+        db.query(models.User).filter(models.User.id == target_id).delete(synchronize_session=False)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        safe_msg = str(exc).replace("'", "").replace('"', '')[:200]
+        return HTMLResponse(
+            f"<script>alert('Delete failed: {safe_msg}'); window.history.back();</script>",
+            status_code=200
+        )
     return RedirectResponse(url="/", status_code=303)
 
 
@@ -2678,7 +2793,7 @@ def build_sidebar(current_user, current_page: str = "") -> str:
                 <i class="{icon_cls('material-movement', 'text-emerald-600')} fa-truck-ramp-box"></i> Material Movement
             </a>
             <a href="/" class="{nav_idle}">
-                <i class="fa-solid fa-boxes-stacked w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Inventory Configuration Log
+                <i class="fa-solid fa-boxes-stacked w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Inventory Log
             </a>
             <a href="/?tab=allocations" class="{nav_idle}">
                 <i class="fa-solid fa-list-check w-5 text-center text-slate-400 group-hover:text-indigo-600"></i> Allocation Log
@@ -3421,6 +3536,15 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             "notes": u.notes or "",
         })
 
+    # Per-item GRN receipt history — used as a fallback for the vendor-lot panel
+    # when an item has stock but no live ItemLot rows (legacy stock recorded
+    # before the lot ledger existed, or lots fully consumed). Lets the panel
+    # still surface the real vendors the item was received from.
+    grn_hist_by_item = {}
+    for g in db.query(models.GRNRecord).all():
+        if (g.quantity or 0) > 0:
+            grn_hist_by_item.setdefault(g.item_id, []).append(g)
+
     item_options = "".join([f'<option value="{i.id}">{i.name} ({i.item_code})</option>' for i in items])
     employee_options = "".join([f'<option value="{e.name}">{e.name} - {e.role_title}</option>' for e in employees])
 
@@ -3609,6 +3733,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             <td class="p-3 text-center">
                 <span class="bg-slate-100 px-2 py-0.5 rounded text-slate-600 text-[10px] font-semibold whitespace-nowrap">{item_cat}</span>
             </td>
+            <td class="p-3 text-center font-mono text-[11px] text-slate-500">{h_uom or '—'}</td>
             {admin_only_cells}
             <td class="p-3 font-mono font-bold text-slate-900" data-sort="{it.current_stock}">
                 {it.current_stock}
@@ -3640,7 +3765,10 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             models.ItemLot.quantity > 0
         ).order_by(models.ItemLot.received_at.asc()).all()
 
-        n_cols = 8 if current_user.role == "Admin" else 6
+        n_cols = 9 if current_user.role == "Admin" else 7
+        lot_caption = f"Vendor / Price Lots for {h_name} (FIFO order — oldest first)"
+        lot_footer = f'Total Quantity: <span class="font-bold text-slate-600">{it.current_stock} {h_uom or ""}</span> &bull; Outward issues consume the oldest lot first.'
+
         if lots:
             lot_lines = "".join(
                 f"""<div class="flex items-center justify-between gap-3 py-1 px-2 odd:bg-white even:bg-slate-50 rounded">
@@ -3651,16 +3779,44 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                 for lot in lots
             )
         else:
-            lot_lines = '<div class="text-slate-400 italic px-2 py-1">No vendor lot records yet — recorded as a single combined balance.</div>'
+            # No live lot ledger — reconstruct a per-vendor view from this item's GRN
+            # receipt history so the real vendors it was received from still appear.
+            # This runs for EVERY asset class: consumables/tools whose lots are
+            # consumed or pre-date the ledger, AND serial-tracked assets (which keep
+            # their vendor/price only in GRN, never in the lot ledger).
+            grn_groups = {}
+            for g in grn_hist_by_item.get(it.id, []):
+                v = (g.vendor or it.supplier or "Approved Vendor").strip() or "Approved Vendor"
+                p = round(float(g.unit_price if g.unit_price is not None else (it.price or 0.0)), 2)
+                grn_groups[(v, p)] = grn_groups.get((v, p), 0) + (g.quantity or 0)
+
+            if grn_groups:
+                lot_caption = f"Vendor / Acquisition for {h_name} (from receipt history)"
+                footer_core = ('Quantities above are total received per vendor, not the live '
+                               'remaining balance.')
+                if is_tracked(it):
+                    footer_core += ' Open the <b>Serials</b> register for unit-level detail.'
+                lot_footer = footer_core
+                lot_lines = "".join(
+                    f"""<div class="flex items-center justify-between gap-3 py-1 px-2 odd:bg-white even:bg-slate-50 rounded">
+                            <span class="font-medium text-slate-600">{_html.escape(v, quote=True)}</span>
+                            <span class="font-mono text-slate-400">&#8377;{p:,.2f}</span>
+                            <span class="font-mono font-bold text-slate-800">{qty} {h_uom or ''}</span>
+                        </div>"""
+                    for (v, p), qty in grn_groups.items()
+                )
+            else:
+                lot_caption = f"Vendor / Acquisition for {h_name}"
+                lot_lines = '<div class="text-slate-400 italic px-2 py-1">No vendor records yet — recorded as a single combined balance.</div>'
 
         inventory_rows += f"""
         <tr id="lot-row-{it.id}" class="lot-detail-row hidden bg-slate-50/70 border-b border-slate-100">
             <td colspan="{n_cols}" class="p-3">
-                <div class="text-[10px] uppercase font-bold text-slate-400 tracking-wider mb-1.5">Vendor / Price Lots for {h_name} (FIFO order — oldest first)</div>
+                <div class="text-[10px] uppercase font-bold text-slate-400 tracking-wider mb-1.5">{lot_caption}</div>
                 <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-1 text-[11px]">
                     {lot_lines}
                 </div>
-                <div class="text-[10px] text-slate-400 mt-1.5">Total Quantity: <span class="font-bold text-slate-600">{it.current_stock} {h_uom or ''}</span> &bull; Outward issues consume the oldest lot first.</div>
+                <div class="text-[10px] text-slate-400 mt-1.5">{lot_footer}</div>
             </td>
         </tr>
         """
@@ -3692,10 +3848,13 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
                 code_assigned = True
             else:
                 real_display_name = raw_name or "Unlisted Item"
-                code_cell = f"""<form action='/procurement/assign-code/{r.id}' method='POST' class='flex gap-1 items-center justify-center'>
-                        <input type='text' name='new_item_code' placeholder='e.g. EIPL-ST-09' required
+                code_cell = f"""<form id='assign-code-form-{r.id}' action='/procurement/assign-code/{r.id}' method='POST' class='flex gap-1 items-center justify-center'
+                        onsubmit='return handleAssignCodeSubmit(event, {r.id})'>
+                        <input type='hidden' name='force' value='false' id='assign-force-{r.id}'>
+                        <input type='text' name='new_item_code' id='assign-input-{r.id}' placeholder='e.g. EIPL-ST-09' required
                             class='border border-amber-300 bg-amber-50 text-slate-900 font-mono text-[11px] px-2 py-1 rounded-lg w-28 uppercase focus:outline-none focus:border-indigo-500'
-                            style='text-transform:uppercase'>
+                            style='text-transform:uppercase'
+                            oninput='this.value=this.value.toUpperCase()'>
                         <button type='submit' class='bg-amber-500 hover:bg-amber-600 text-white font-bold text-[10px] px-2 py-1 rounded-lg'>Assign</button>
                     </form>"""
                 code_assigned = False
@@ -3828,6 +3987,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
             <td class="p-3 text-slate-500 font-mono whitespace-nowrap text-center">{date_str}</td>
             <td class="p-3 text-slate-800 text-center">{item_desc_display}</td>
             <td class="p-3 font-mono font-semibold text-center">{r.quantity}</td>
+            <td class="p-3 font-mono text-slate-500 text-center">{getattr(r, 'uom', None) or 'Nos'}</td>
             {est_td}
             <td class="p-3 text-center">{code_cell}</td>
             <td class="p-3 text-center">{spec_cell}</td>
@@ -3959,7 +4119,7 @@ def root_dashboard(current_user: models.User = Depends(get_current_user), db: Se
         for i in items
     ])
 
-    est_value_header = '<th class="p-3 text-center whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable(\'req\',3)">Est. Value <i class="fa-solid fa-sort text-[9px]"></i></th>' if current_user.role == "Admin" else ""
+    est_value_header = '<th class="p-3 text-center whitespace-nowrap cursor-pointer hover:text-indigo-600" onclick="sortTable(\'req\',4)">Est. Value <i class="fa-solid fa-sort text-[9px]"></i></th>' if current_user.role == "Admin" else ""
 
     return templates.LAYOUT_HTML\
         .replace("__LOGO_DATA_URL__", LOGO_DATA_URL)\
